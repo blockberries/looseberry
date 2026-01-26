@@ -372,4 +372,99 @@ Phase 4 implements the primary layer that handles header creation, vote collecti
 
 ---
 
-*Next Phase: Phase 5 - DAG Implementation*
+## Phase 5: DAG Implementation
+
+**Status:** Completed
+
+### Summary
+
+Phase 5 implements the certificate DAG (Directed Acyclic Graph) that maintains causal ordering of certificates across rounds. The DAG tracks certificates by round and validator, supports traversal of causal history, and provides deterministic certificate ordering.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `dag/dag.go` | DAG implementation with round management and causal history |
+| `dag/dag_test.go` | DAG unit tests |
+
+### Interface Update
+
+| File | Change |
+|------|--------|
+| `store/store.go` | Added `HighestRound()` to CertificateStore interface |
+| `store/memory_cert.go` | Implemented `HighestRound()` method |
+
+### Key Functionality Implemented
+
+1. **DAG Core** (`dag/dag.go`)
+   - In-memory round-indexed certificate storage
+   - Persistent storage fallback via CertificateStore
+   - Highest round and committed round tracking
+   - Thread-safe with RWMutex
+
+2. **RoundData Structure**
+   - Per-round certificate storage by validator index
+   - Committed status tracking
+   - Certificate count and existence queries
+
+3. **Certificate Management**
+   - `AddCertificate()`: Add with duplicate detection
+   - `GetCertificate()`: Retrieve by digest
+   - `HasCertificate()`: Existence check
+   - `GetCertificatesForRound()`: All certs for a round
+   - `GetCertificateForValidator()`: Specific validator's cert
+
+4. **Round Advancement**
+   - `CanAdvanceToRound()`: Check if quorum exists in previous round
+   - `SetCommittedRound()`: Mark rounds as committed
+   - Automatic highest round tracking
+
+5. **Causal History**
+   - `CausalHistory()`: BFS traversal of parent certificates
+   - Result caching for performance
+   - Configurable max depth to prevent unbounded traversal
+
+6. **Certificate Ordering**
+   - `GetOrderedCertificates()`: Deterministic ordering by round then validator
+   - Used for block building and replay
+
+7. **Memory Management**
+   - `PruneRound()`: Remove single round from memory
+   - `PruneRoundsBefore()`: Bulk prune old rounds
+   - `LoadRound()`: Load from persistent storage
+   - `LoadRoundsFrom()`: Bulk load from round
+
+8. **Configuration**
+   - MaxCachedRounds (default: 100)
+   - MaxHistoryDepth (default: 1000)
+
+### Test Coverage
+
+22 DAG tests covering:
+- Certificate addition (normal, duplicate, nil)
+- Certificate retrieval (by digest, round, validator)
+- Round advancement checks
+- Committed round management
+- Causal history traversal and caching
+- Ordered certificate retrieval
+- Memory pruning (single round, bulk)
+- Loading from persistent storage
+- Operation without persistent store
+
+### Design Decisions
+
+1. **Dual Storage**: Memory cache for fast access, persistent store for durability. GetCertificate falls back to store if not in memory.
+
+2. **Round-Indexed Storage**: Primary index is by round for efficient round-based queries and GC.
+
+3. **Causal History Caching**: BFS traversal results are cached to avoid repeated computation for the same certificate.
+
+4. **Deterministic Ordering**: Within rounds, certificates are ordered by validator index for reproducible block building.
+
+5. **Lazy Loading**: Rounds can be loaded from persistent storage on demand rather than all at startup.
+
+6. **Committed Round Tracking**: Separate tracking allows GC decisions and flow control based on consensus progress.
+
+---
+
+*Next Phase: Phase 6 - Network Protocol*

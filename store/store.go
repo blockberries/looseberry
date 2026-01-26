@@ -45,6 +45,9 @@ type CertificateStore interface {
 	// DeleteCertificatesBefore deletes all certificates before the given round.
 	DeleteCertificatesBefore(round uint64) error
 
+	// HighestRound returns the highest round stored.
+	HighestRound() uint64
+
 	// Close closes the store.
 	Close() error
 }

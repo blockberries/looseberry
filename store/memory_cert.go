@@ -180,6 +180,20 @@ func (s *MemoryCertificateStore) Close() error {
 	return nil
 }
 
+// HighestRound returns the highest round stored.
+func (s *MemoryCertificateStore) HighestRound() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var highest uint64
+	for round := range s.byRound {
+		if round > highest {
+			highest = round
+		}
+	}
+	return highest
+}
+
 // Len returns the number of stored certificates (for testing).
 func (s *MemoryCertificateStore) Len() int {
 	s.mu.RLock()
