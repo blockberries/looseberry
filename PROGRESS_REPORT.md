@@ -121,4 +121,93 @@ All types have comprehensive unit tests covering:
 
 ---
 
-*Next Phase: Phase 2 - Storage Layer*
+## Phase 2: Storage Layer
+
+**Status:** Completed
+
+### Summary
+
+Phase 2 implements the persistent and in-memory storage layer for batches, certificates, and transaction indexing. Both in-memory implementations (for testing) and LevelDB implementations (for production) are provided.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `store/store.go` | Storage interface definitions (BatchStore, CertificateStore, TxIndex) |
+| `store/memory_batch.go` | In-memory BatchStore implementation |
+| `store/memory_batch_test.go` | MemoryBatchStore unit tests |
+| `store/memory_cert.go` | In-memory CertificateStore implementation |
+| `store/memory_cert_test.go` | MemoryCertificateStore unit tests |
+| `store/memory_txindex.go` | In-memory TxIndex implementation |
+| `store/memory_txindex_test.go` | MemoryTxIndex unit tests |
+| `store/leveldb_batch.go` | LevelDB BatchStore implementation |
+| `store/leveldb_batch_test.go` | LevelDBBatchStore unit tests |
+| `store/leveldb_cert.go` | LevelDB CertificateStore implementation |
+| `store/leveldb_cert_test.go` | LevelDBCertificateStore unit tests |
+
+### Key Functionality Implemented
+
+1. **BatchStore Interface** (`store/store.go`)
+   - `SaveBatch()`, `GetBatch()`, `HasBatch()`
+   - `GetBatchesByRound()` for round-based queries
+   - `DeleteBatchesBefore()` for garbage collection
+   - `Close()` for cleanup
+
+2. **CertificateStore Interface** (`store/store.go`)
+   - `SaveCertificate()`, `GetCertificate()`, `HasCertificate()`
+   - `GetCertificatesByRound()` for round-based queries
+   - `GetCertificateForValidator()` for validator-specific lookups
+   - `DeleteCertificatesBefore()` for garbage collection
+
+3. **TxIndex Interface** (`store/store.go`)
+   - `AddTx()`, `GetBatchForTx()`, `HasTx()` for O(1) tx lookup
+   - `RemoveTxsForBatch()` for batch removal
+   - `AddBatch()` helper for batch indexing
+
+4. **In-Memory Implementations**
+   - Thread-safe with RWMutex
+   - Round-indexed for efficient queries
+   - Suitable for testing
+   - Deep copy on read to prevent mutations
+
+5. **LevelDB Implementations**
+   - Key schemas:
+     - Batch: `B:{digest}` → batch data, `BR:{round}:{digest}` → index
+     - Certificate: `C:{digest}` → cert data, `CR:{round}:{validator}` → digest
+   - Atomic writes using LevelDB batches
+   - Highest round tracking for metadata
+   - Persistence verification tests
+
+### Test Coverage
+
+43 storage tests covering:
+- Save and retrieve operations
+- Has/existence checks
+- Round-based queries
+- Validator-specific queries
+- Delete operations
+- Idempotent operations
+- Close behavior
+- Persistence (LevelDB)
+- Highest round tracking
+
+### Design Decisions
+
+1. **Interface-Based Design**: All stores implement interfaces for testability and flexibility.
+
+2. **Gob Encoding**: Used encoding/gob for LevelDB serialization. Simple, handles Go types well, and sufficient for internal storage.
+
+3. **Key Schema**: LevelDB keys use prefixes for namespace separation:
+   - `B:` for batches, `BR:` for batch round index
+   - `C:` for certificates, `CR:` for cert round/validator index
+   - `BM:`, `CM:` for metadata
+
+4. **Clone on Read**: All Get operations return clones to prevent callers from mutating stored data.
+
+5. **Atomic Writes**: LevelDB uses write batches for atomic operations (data + indices).
+
+6. **Bidirectional TxIndex**: Maintains both txHash→batchHash and batchHash→[]txHash mappings for efficient lookups and removals.
+
+---
+
+*Next Phase: Phase 3 - Worker Implementation*
