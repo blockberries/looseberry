@@ -558,4 +558,78 @@ The Network interface is designed for integration with glueberry (P2P networking
 
 ---
 
-*Next Phase: Phase 7 - Garbage Collection & Flow Control*
+## Phase 7: Garbage Collection & Flow Control
+
+**Status:** Completed
+
+### Summary
+
+Phase 7 implements garbage collection for old rounds and flow control to prevent unbounded DAG growth. The GC manager prunes old data while recovering uncommitted transactions, and the flow controller pauses header creation when the system falls too far behind.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `gc/gc.go` | GC manager for round pruning and transaction recovery |
+| `gc/gc_test.go` | GC manager unit tests |
+| `gc/flow.go` | Flow controller for preventing runaway round advancement |
+| `gc/flow_test.go` | Flow controller unit tests |
+
+### Key Functionality Implemented
+
+1. **GCManager** (`gc/gc.go`)
+   - NotifyCommitted for triggering GC on consensus commit
+   - Automatic pruning of rounds older than GCDepth
+   - Transaction recovery from uncommitted batches
+   - Background GC loop with configurable interval
+   - ForceGC for immediate garbage collection
+   - Prunes from DAG memory and persistent storage
+
+2. **Transaction Recovery**
+   - Extracts transactions from batches not in committed certificates
+   - Callback mechanism for re-injecting recovered transactions
+   - Prevents transaction loss during round pruning
+
+3. **FlowController** (`gc/flow.go`)
+   - Tracks gap between current and committed rounds
+   - CanCreateHeader/CanAdvanceRound for flow control checks
+   - Automatic pause when gap exceeds MaxUncommittedRounds
+   - Automatic resume when consensus catches up
+   - Pause/resume callbacks for system notifications
+   - Metrics for monitoring (pause count, resume count, gap)
+
+4. **Configuration**
+   - GC: GCDepth (100), GCInterval (30s), RecoverUncommittedTxs (true)
+   - Flow: MaxUncommittedRounds (100), MaxPendingBatches (1000), MaxPendingHeaders (100)
+
+### Test Coverage
+
+18 GC tests covering:
+- Start/stop lifecycle
+- NotifyCommitted triggering GC
+- Round pruning from DAG and storage
+- Transaction recovery from uncommitted batches
+- Background GC loop
+- ForceGC immediate operation
+- Flow control pause/resume
+- Uncommitted gap calculations
+- Metrics tracking
+- Multiple pause-resume cycles
+
+### Design Decisions
+
+1. **Consensus-Driven GC**: GC is triggered by consensus commits, not time-based, ensuring safety.
+
+2. **Transaction Recovery**: Uncommitted transactions are recovered before pruning to prevent loss.
+
+3. **Callback-Based Recovery**: TxRecoveryCallback allows flexible handling (re-batching, logging, etc.).
+
+4. **Atomic Flow Control**: Uses atomic operations for thread-safe round tracking without locks.
+
+5. **Pause/Resume Callbacks**: System can react to flow control state changes (logging, metrics, etc.).
+
+6. **Configurable Depth**: GCDepth allows tuning retention vs memory usage trade-off.
+
+---
+
+*Next Phase: Phase 8 - Dynamic Worker Scaling*
