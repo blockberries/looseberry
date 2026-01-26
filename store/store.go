@@ -54,6 +54,9 @@ type TxIndex interface {
 	// AddTx adds a transaction hash to batch mapping.
 	AddTx(txHash, batchHash types.Hash) error
 
+	// AddBatch indexes all transactions in a batch.
+	AddBatch(batch *types.Batch) error
+
 	// GetBatchForTx returns the batch hash containing the transaction.
 	GetBatchForTx(txHash types.Hash) (types.Hash, error)
 

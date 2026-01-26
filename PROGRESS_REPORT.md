@@ -210,4 +210,79 @@ Phase 2 implements the persistent and in-memory storage layer for batches, certi
 
 ---
 
-*Next Phase: Phase 3 - Worker Implementation*
+## Phase 3: Worker Implementation
+
+**Status:** Completed
+
+### Summary
+
+Phase 3 implements the worker layer that handles transaction batching, deduplication, backpressure, and batch acknowledgment tracking.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `worker/worker.go` | Worker implementation with tx batching |
+| `worker/worker_test.go` | Worker unit tests |
+| `worker/ack_tracker.go` | Acknowledgment tracker for pending batches |
+| `worker/ack_tracker_test.go` | AckTracker unit tests |
+| `worker/pool.go` | Worker pool with hash-based tx routing |
+| `worker/pool_test.go` | Pool unit tests |
+
+### Key Functionality Implemented
+
+1. **Worker Core** (`worker/worker.go`)
+   - Transaction deduplication using hash set
+   - Backpressure with configurable limits:
+     - MaxPendingTxs (default: 10,000)
+     - MaxPendingBytes (default: 50MB)
+   - Automatic batch creation on timeout or size
+   - TxValidator integration for CheckTx
+   - Round and epoch tracking
+
+2. **Batch Creation**
+   - Trigger on BatchTimeout (default: 100ms) or BatchSize (default: 1000)
+   - Automatic storage in BatchStore
+   - Transaction indexing in TxIndex
+   - BatchCallback notification for broadcasting
+
+3. **Acknowledgment Tracker** (`worker/ack_tracker.go`)
+   - Track pending batches awaiting acks
+   - Record acks with quorum detection
+   - Automatic timeout cleanup
+   - Thread-safe with RWMutex
+
+4. **Worker Pool** (`worker/pool.go`)
+   - Hash-based transaction routing to workers
+   - Dynamic scaling (ScaleUp/ScaleDown)
+   - MinWorkers/MaxWorkers configuration
+   - Shared state propagation (round, epoch, quorum)
+   - Unified batch callback
+
+### Test Coverage
+
+39 worker tests covering:
+- Transaction add with deduplication
+- Backpressure (count and bytes limits)
+- Batch creation on timeout and size
+- Transaction validation
+- Start/stop lifecycle
+- Ack tracking and quorum detection
+- Pool routing and scaling
+- Concurrent operations with race detection
+
+### Design Decisions
+
+1. **Hash-Based Routing**: Transactions are routed to workers based on tx hash for deterministic distribution and natural deduplication.
+
+2. **Configurable Limits**: Backpressure uses both count and byte limits to handle varying transaction sizes.
+
+3. **Flush on Stop**: Workers create a final batch with pending transactions during shutdown.
+
+4. **Separate AckTracker**: Decoupled from worker for testability and potential reuse.
+
+5. **Pool Scaling**: Manual scale up/down methods for external control; auto-scaling deferred to Phase 8.
+
+---
+
+*Next Phase: Phase 4 - Primary Implementation*
