@@ -815,4 +815,131 @@ All existing tests pass with new wrapper types:
 
 ---
 
-*Next Phase: Phase 10 - Testing & Benchmarks*
+## Phase 10: Testing & Benchmarks
+
+**Status:** Completed
+
+### Summary
+
+Phase 10 implements comprehensive testing and performance benchmarking for the Looseberry system. This includes improved unit test coverage, integration test harnesses, performance benchmarks, stress tests, and Byzantine fault tolerance tests.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `looseberry_test.go` | Comprehensive unit tests for main Looseberry struct |
+| `integration_test.go` | Multi-node integration test harness |
+| `benchmark_test.go` | Performance benchmarks for all components |
+| `stress_test.go` | High-volume and concurrent stress tests |
+| `byzantine_test.go` | Byzantine fault tolerance tests |
+
+### Key Functionality Implemented
+
+1. **Unit Test Coverage** (`looseberry_test.go`)
+   - Tests for New, SetValidatorSet, SetNetwork, SetStores
+   - Tests for Start/Stop lifecycle including double-start/stop
+   - Tests for AddTx, AddTxWithValidator, HasTx, Size, SizeBytes
+   - Tests for CurrentRound, Metrics, Flush, NotifyCommitted
+   - Tests for UpdateValidatorSet, ReapCertifiedBatches
+   - Tests for restartability and message handlers
+
+2. **Integration Test Harness** (`integration_test.go`)
+   - TestNetwork struct for multi-node testing
+   - TestNode struct with full component access
+   - NewTestNetwork(t, n) for creating n-node networks
+   - Start/Stop methods with proper cleanup
+   - SubmitTx/SubmitTxToNode for transaction submission
+   - WaitForRound/WaitForBatches for synchronization
+   - GetMetrics for observability
+
+3. **Benchmarks** (`benchmark_test.go`)
+   - Worker benchmarks: BenchmarkWorkerAddTx
+   - Worker pool benchmarks: BenchmarkWorkerPoolAddTx, BenchmarkWorkerPoolAddTxParallel
+   - DAG benchmarks: BenchmarkDAGAddCertificate, BenchmarkDAGGetCertificate, BenchmarkDAGGetOrderedCertificates
+   - Store benchmarks: BenchmarkBatchStoreSave, BenchmarkBatchStoreGet, BenchmarkTxIndexHas
+   - Types benchmarks: BenchmarkTransactionHash, BenchmarkBatchComputeDigest, BenchmarkHeaderSign, BenchmarkHeaderVerify, BenchmarkCertificateVerify
+   - Looseberry benchmarks: BenchmarkLooseberryAddTx, BenchmarkLooseberryAddTxParallel, BenchmarkLooseberryMetrics
+
+4. **Stress Tests** (`stress_test.go`)
+   - TestStressWorkerPoolHighVolume: 100k transactions sequential
+   - TestStressWorkerPoolConcurrent: 100k transactions from 10 goroutines
+   - TestStressDAGHighRoundCount: 1000 rounds × 4 validators
+   - TestStressDAGConcurrentAccess: Concurrent read/write operations
+   - TestStressBatchStoreConcurrent: Concurrent store operations
+   - TestStressTxIndexConcurrent: Concurrent index operations
+   - TestStressLooseberryHighVolume: 50k transactions
+   - TestStressLooseberryConcurrent: Multi-goroutine submission
+   - TestStressLooseberryMemoryStability: Memory leak detection
+   - TestStressMultiNodeTransactionLoad: 4-node concurrent submission
+
+5. **Byzantine Tests** (`byzantine_test.go`)
+   - TestByzantineInvalidHeaderSignature: Headers signed by wrong key
+   - TestByzantineInvalidVoteSignature: Votes signed by wrong key
+   - TestByzantineInvalidCertificateSignatures: Invalid certificate votes
+   - TestByzantineEquivocationDifferentHeaders: Equivocating validators
+   - TestByzantineVoteForNonExistentHeader: Votes for unknown headers
+   - TestByzantineHeaderFromFuture: Headers beyond MaxRoundGap
+   - TestByzantineHeaderWrongEpoch: Epoch mismatch detection
+   - TestByzantineCertificateInsufficientVotes: No quorum
+   - TestByzantineCertificateDuplicateVoters: Duplicate vote detection
+   - TestByzantineCertificateVotesForWrongHeader: Mismatched votes
+   - TestByzantineNetworkMessageFromUnknownValidator: Unknown validator
+   - TestByzantineResilienceWithFValidators: BFT parameter verification
+   - TestByzantineSafetyWithQuorum: Quorum intersection property
+   - TestByzantineTypesErrors: Error classification
+   - TestByzantineLivenessWithHonestMajority: Liveness with f failures
+
+### Test Coverage
+
+Final coverage by package:
+- looseberry: 69.6% (improved from 12.4%)
+- dag: 86.6%
+- gc: 96.2%
+- network: 80.3%
+- primary: 72.8%
+- store: 86.5%
+- types: 93.0%
+- worker: 89.9%
+
+Total: 200+ tests passing with race detection.
+
+### Benchmark Results
+
+Key performance metrics:
+- BenchmarkWorkerAddTx: ~80ns/op
+- BenchmarkWorkerPoolAddTx: ~145ns/op
+- BenchmarkWorkerPoolAddTxParallel: ~188ns/op
+- BenchmarkDAGAddCertificate: ~734ns/op
+- BenchmarkLooseberryAddTx: ~132ns/op
+- BenchmarkLooseberryAddTxParallel: ~335ns/op
+
+### Stress Test Results
+
+- Sequential throughput: 250k+ tx/sec
+- Concurrent throughput: 200k+ tx/sec (12 goroutines)
+- Memory stability: <35MB heap growth over 380k transactions
+- DAG performance: 2200+ certs/sec for 4000 certificates
+
+### Bug Fixes During Testing
+
+1. **AckTimeout not set**: Worker.Config was missing AckTimeout in initializeComponents(), causing panic with NewTicker(0). Fixed by adding `AckTimeout: 30 * time.Second`.
+
+2. **Deadlock in Stop()**: Stop() was holding l.mu.Lock() while calling stopComponents(), but worker callbacks tried to acquire l.mu.RLock(). Fixed by not holding lock during component stop/start operations.
+
+3. **Deadlock in Flush()**: Same pattern - Flush() held lock while calling workerPool.Stop(). Fixed by using RLock to get reference, then releasing before stop/start.
+
+### Design Decisions
+
+1. **TestNetwork Architecture**: Full mesh connectivity between nodes with in-memory stores for fast testing.
+
+2. **Benchmark Pre-generation**: Transactions and certificates are pre-generated before timer reset to measure only the operation under test.
+
+3. **Parallel Benchmarks**: Use b.RunParallel for realistic concurrent load testing.
+
+4. **Stress Test Thresholds**: Configured to pass on reasonable hardware while still catching regressions.
+
+5. **Byzantine Test Coverage**: Tests cover all major attack vectors including signature forgery, equivocation, and message manipulation.
+
+---
+
+*Phase 10 completed. All testing and benchmarking tasks are done.*

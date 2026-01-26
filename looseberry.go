@@ -277,6 +277,7 @@ func (l *Looseberry) initializeComponents() error {
 			BatchTimeout:    l.cfg.Worker.BatchTimeout,
 			MaxPendingTxs:   l.cfg.Worker.MaxPendingTxs,
 			MaxPendingBytes: l.cfg.Worker.MaxPendingBytes,
+			AckTimeout:      30 * time.Second,
 		},
 	}
 	l.workerPool = worker.NewPool(poolCfg, l.cfg.ValidatorIndex, l.batchStore, l.txIndex, l.validatorSet.Quorum())
@@ -416,16 +417,17 @@ func (l *Looseberry) Stop() error {
 	// Wait for message loop to finish
 	l.wg.Wait()
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Stop network
+	// Stop network first (without lock to allow callbacks to complete)
 	if l.network != nil {
 		_ = l.network.Stop()
 	}
 
-	// Stop components in reverse order
+	// Stop components in reverse order (without lock to avoid deadlock with callbacks)
 	l.stopComponents()
+
+	// Now acquire lock to close stores
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	// Close stores
 	if l.batchStore != nil {
@@ -600,13 +602,19 @@ func (l *Looseberry) SizeBytes() int64 {
 
 // Flush implements DAGMempool.
 func (l *Looseberry) Flush() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	if !l.running.Load() {
+		return
+	}
+
+	l.mu.RLock()
+	pool := l.workerPool
+	l.mu.RUnlock()
 
 	// Stop and restart workers to flush pending transactions
-	if l.workerPool != nil && l.running.Load() {
-		_ = l.workerPool.Stop()
-		_ = l.workerPool.Start()
+	// Don't hold lock during stop/start to avoid deadlock with callbacks
+	if pool != nil {
+		_ = pool.Stop()
+		_ = pool.Start()
 	}
 }
 
