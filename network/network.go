@@ -56,6 +56,25 @@ type SyncResponse struct {
 	ToRound      uint64
 }
 
+// SyncRequestMessage wraps a sync request with sender info.
+type SyncRequestMessage struct {
+	Request *SyncRequest
+	From    uint16
+}
+
+// SyncResponseMessage wraps a sync response with sender info.
+type SyncResponseMessage struct {
+	Response *SyncResponse
+	From     uint16
+}
+
+// BatchAck represents a batch acknowledgment.
+type BatchAck struct {
+	BatchDigest types.Hash
+	Validator   uint16
+	Signature   types.Signature
+}
+
 // Network defines the interface for network communication.
 type Network interface {
 	// Broadcast sends a message to all validators.
@@ -78,7 +97,7 @@ type Network interface {
 	VoteMessages() <-chan *VoteMessage
 	CertificateMessages() <-chan *CertificateMessage
 	SyncRequests() <-chan *SyncRequest
-	SyncResponses() <-chan *SyncResponse
+	SyncResponses() <-chan *SyncResponseMessage
 
 	// ValidatorID returns this node's validator ID.
 	ValidatorID() uint16

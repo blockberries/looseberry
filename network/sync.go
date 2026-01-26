@@ -304,41 +304,14 @@ func (s *SyncManager) handleMessages() {
 			if req != nil {
 				_ = s.HandleSyncRequest(req)
 			}
-		case resp := <-syncResps:
-			if resp != nil {
-				// Note: we don't have the sender in SyncResponse
-				// In a real implementation, the message would include sender
-				_ = s.handleSyncResponseInternal(resp)
+		case msg := <-syncResps:
+			if msg != nil && msg.Response != nil {
+				_ = s.HandleSyncResponse(msg.Response, msg.From)
 			}
 		case <-s.stopCh:
 			return
 		}
 	}
-}
-
-func (s *SyncManager) handleSyncResponseInternal(resp *SyncResponse) error {
-	// Store batches first
-	for _, batch := range resp.Batches {
-		if err := s.batchStore.SaveBatch(batch); err != nil {
-			return err
-		}
-	}
-
-	// Store certificates
-	for _, cert := range resp.Certificates {
-		if err := s.dag.AddCertificate(cert); err != nil {
-			if err != types.ErrDuplicateHeader {
-				return err
-			}
-		}
-	}
-
-	// Notify callback
-	if s.onSyncComplete != nil && len(resp.Certificates) > 0 {
-		s.onSyncComplete(resp.FromRound, resp.ToRound)
-	}
-
-	return nil
 }
 
 // GetPendingRequestCount returns the number of pending sync requests.

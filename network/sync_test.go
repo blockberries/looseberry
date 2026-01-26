@@ -188,11 +188,11 @@ func TestSyncManagerHandleSyncRequest(t *testing.T) {
 
 	// Check network2 received response
 	select {
-	case resp := <-network2.SyncResponses():
-		if len(resp.Certificates) != 5 {
-			t.Errorf("Expected 5 certificates, got %d", len(resp.Certificates))
+	case msg := <-network2.SyncResponses():
+		if len(msg.Response.Certificates) != 5 {
+			t.Errorf("Expected 5 certificates, got %d", len(msg.Response.Certificates))
 		}
-		if resp.FromRound != 0 || resp.ToRound != 4 {
+		if msg.Response.FromRound != 0 || msg.Response.ToRound != 4 {
 			t.Error("Sync response round mismatch")
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -244,12 +244,12 @@ func TestSyncManagerHandleSyncRequestWithBatches(t *testing.T) {
 	}
 
 	select {
-	case resp := <-network2.SyncResponses():
-		if len(resp.Certificates) != 1 {
-			t.Errorf("Expected 1 certificate, got %d", len(resp.Certificates))
+	case msg := <-network2.SyncResponses():
+		if len(msg.Response.Certificates) != 1 {
+			t.Errorf("Expected 1 certificate, got %d", len(msg.Response.Certificates))
 		}
-		if len(resp.Batches) != 1 {
-			t.Errorf("Expected 1 batch, got %d", len(resp.Batches))
+		if len(msg.Response.Batches) != 1 {
+			t.Errorf("Expected 1 batch, got %d", len(msg.Response.Batches))
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("Did not receive sync response")
@@ -356,13 +356,13 @@ func TestSyncManagerHandleSyncRequestLatest(t *testing.T) {
 	}
 
 	select {
-	case resp := <-network2.SyncResponses():
+	case msg := <-network2.SyncResponses():
 		// Should get rounds 5-9 (5 certs)
-		if len(resp.Certificates) != 5 {
-			t.Errorf("Expected 5 certificates, got %d", len(resp.Certificates))
+		if len(msg.Response.Certificates) != 5 {
+			t.Errorf("Expected 5 certificates, got %d", len(msg.Response.Certificates))
 		}
-		if resp.ToRound != 9 {
-			t.Errorf("Expected toRound 9, got %d", resp.ToRound)
+		if msg.Response.ToRound != 9 {
+			t.Errorf("Expected toRound 9, got %d", msg.Response.ToRound)
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("Did not receive sync response")

@@ -21,7 +21,7 @@ type MockNetwork struct {
 	voteCh         chan *VoteMessage
 	certCh         chan *CertificateMessage
 	syncReqCh      chan *SyncRequest
-	syncRespCh     chan *SyncResponse
+	syncRespCh     chan *SyncResponseMessage
 
 	// Connected peers (for testing multi-node scenarios)
 	peers   map[uint16]*MockNetwork
@@ -59,7 +59,7 @@ func NewMockNetwork(validatorID uint16, cfg Config) *MockNetwork {
 		voteCh:         make(chan *VoteMessage, cfg.BufferSize),
 		certCh:         make(chan *CertificateMessage, cfg.BufferSize),
 		syncReqCh:      make(chan *SyncRequest, cfg.BufferSize),
-		syncRespCh:     make(chan *SyncResponse, cfg.BufferSize),
+		syncRespCh:     make(chan *SyncResponseMessage, cfg.BufferSize),
 		peers:          make(map[uint16]*MockNetwork),
 		stopCh:         make(chan struct{}),
 	}
@@ -318,8 +318,13 @@ func (m *MockNetwork) SendSyncResponse(validator uint16, resp *SyncResponse) err
 		return types.ErrValidatorNotFound
 	}
 
+	msg := &SyncResponseMessage{
+		Response: resp,
+		From:     m.validatorID,
+	}
+
 	select {
-	case peer.syncRespCh <- resp:
+	case peer.syncRespCh <- msg:
 		return nil
 	default:
 		return types.ErrMempoolFull
@@ -362,7 +367,7 @@ func (m *MockNetwork) SyncRequests() <-chan *SyncRequest {
 }
 
 // SyncResponses returns the channel for incoming sync responses.
-func (m *MockNetwork) SyncResponses() <-chan *SyncResponse {
+func (m *MockNetwork) SyncResponses() <-chan *SyncResponseMessage {
 	return m.syncRespCh
 }
 
@@ -421,7 +426,7 @@ func (m *MockNetwork) InjectSyncRequest(req *SyncRequest) {
 }
 
 // InjectSyncResponse injects a sync response for testing.
-func (m *MockNetwork) InjectSyncResponse(resp *SyncResponse) {
+func (m *MockNetwork) InjectSyncResponse(resp *SyncResponseMessage) {
 	select {
 	case m.syncRespCh <- resp:
 	default:

@@ -374,10 +374,10 @@ func TestMockNetworkSendSyncResponse(t *testing.T) {
 
 	select {
 	case msg := <-m2.SyncResponses():
-		if len(msg.Certificates) != 1 {
+		if len(msg.Response.Certificates) != 1 {
 			t.Error("Expected 1 certificate")
 		}
-		if msg.FromRound != 10 || msg.ToRound != 10 {
+		if msg.Response.FromRound != 10 || msg.Response.ToRound != 10 {
 			t.Error("Sync response round mismatch")
 		}
 	case <-time.After(100 * time.Millisecond):
