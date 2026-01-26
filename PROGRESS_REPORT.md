@@ -285,4 +285,91 @@ Phase 3 implements the worker layer that handles transaction batching, deduplica
 
 ---
 
-*Next Phase: Phase 4 - Primary Implementation*
+## Phase 4: Primary Implementation
+
+**Status:** Completed
+
+### Summary
+
+Phase 4 implements the primary layer that handles header creation, vote collection, certificate formation, and header validation. The primary coordinates the DAG-based consensus by creating headers that reference batch digests and collecting votes to form certificates.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `primary/vote_tracker.go` | Vote tracker for pending headers and certificate formation |
+| `primary/vote_tracker_test.go` | VoteTracker unit tests |
+| `primary/primary.go` | Primary implementation with header loop and handlers |
+| `primary/primary_test.go` | Primary unit tests |
+
+### Key Functionality Implemented
+
+1. **VoteTracker** (`primary/vote_tracker.go`)
+   - Track pending headers waiting for votes
+   - Record votes from validators (deduplicated)
+   - Automatic certificate formation when quorum reached
+   - Timeout detection for stale headers
+   - Thread-safe with RWMutex
+
+2. **Primary Core** (`primary/primary.go`)
+   - Header creation loop with configurable timeout
+   - Batch digest collection for headers
+   - Parent certificate selection (quorum from previous round)
+   - Round and epoch tracking
+   - Start/Stop lifecycle management
+
+3. **Vote Handling**
+   - Vote signature verification
+   - Pending vote buffering for unknown headers
+   - Certificate storage on quorum
+   - Callback notifications
+
+4. **Header Handling**
+   - Header signature verification
+   - Round range validation (within MaxRoundGap)
+   - Epoch validation
+   - Parent certificate verification
+   - Batch availability checking
+   - Vote creation and sending
+
+5. **Certificate Handling**
+   - Certificate verification via ValidatorSet
+   - Certificate storage
+   - Round advancement on quorum certificates
+
+6. **Configuration**
+   - HeaderTimeout (default: 500ms)
+   - MaxBatchesPerHeader (default: 100)
+   - VoteTimeout (default: 30s)
+   - MaxRoundGap (default: 10)
+
+### Test Coverage
+
+18 primary tests covering:
+- Start/stop lifecycle
+- Batch digest addition
+- Header creation on timeout
+- Vote handling and certificate formation
+- Header validation (signature, round, epoch, parents)
+- Pending vote buffering
+- Round and epoch management
+- Vote tracker operations (track, record, duplicate, timeout)
+- Configuration defaults
+
+### Design Decisions
+
+1. **Periodic Header Creation**: Headers are created on a timer rather than event-driven. This simplifies the logic and ensures regular DAG progress.
+
+2. **Pending Votes Buffer**: Votes can arrive before their headers (network reordering). These are buffered and processed when the header arrives.
+
+3. **Callbacks for Extensibility**: HeaderCallback, VoteCallback, and CertificateCallback allow the network layer to handle distribution.
+
+4. **Parent Selection**: Takes up to quorum certificates from the previous round, sorted by validator index for determinism.
+
+5. **Batch Availability**: Headers with missing batches are not voted on. Full implementation would request missing batches.
+
+6. **Separate VoteTracker**: Decoupled from Primary for testability and clarity. Handles the bookkeeping of votes → certificate formation.
+
+---
+
+*Next Phase: Phase 5 - DAG Implementation*
