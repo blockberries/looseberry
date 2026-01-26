@@ -632,4 +632,94 @@ Phase 7 implements garbage collection for old rounds and flow control to prevent
 
 ---
 
-*Next Phase: Phase 8 - Dynamic Worker Scaling*
+## Phase 8: Dynamic Worker Scaling
+
+**Status:** Completed
+
+### Summary
+
+Phase 8 implements automatic worker pool scaling based on load metrics. The scaler monitors the ratio of pending transactions to worker capacity and scales up when overloaded or down when underutilized, with cooldown periods to prevent thrashing.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `worker/scaler.go` | Auto-scaler with load-based scaling and metrics |
+| `worker/scaler_test.go` | Scaler unit tests |
+
+### Key Functionality Implemented
+
+1. **Load Calculation** (`worker/scaler.go`)
+   - Load = pending transactions / (worker count × batch size)
+   - Tracks current capacity vs demand
+   - Returns 0 when no workers or no capacity
+
+2. **Automatic Scaling**
+   - Scale up when load > ScaleUpThreshold (default: 0.8)
+   - Scale down when load < ScaleDownThreshold (default: 0.2)
+   - Background scaling loop at configurable interval
+   - Respects pool min/max worker limits
+
+3. **Cooldown Protection**
+   - ScaleCooldown prevents rapid scaling (default: 5s)
+   - Prevents oscillation during load fluctuations
+   - Last scale time tracked per operation
+
+4. **Scale Event History**
+   - Ring buffer of recent scaling events
+   - Each event records: time, old/new workers, load, direction
+   - Configurable max events (default: 100)
+
+5. **Metrics Collection**
+   - CurrentWorkers, CurrentLoad
+   - ScaleUpCount, ScaleDownCount
+   - LastScaleTime
+   - RecentEvents for history
+
+6. **Callbacks**
+   - SetScaleUpCallback for scale-up notifications
+   - SetScaleDownCallback for scale-down notifications
+   - Thread-safe callback registration and invocation
+
+7. **Manual Scaling**
+   - ForceScaleUp for testing/override
+   - ForceScaleDown for testing/override
+   - Both update metrics and invoke callbacks
+
+8. **Configuration**
+   - ScaleUpThreshold (default: 0.8 = 80% capacity)
+   - ScaleDownThreshold (default: 0.2 = 20% capacity)
+   - ScalingInterval (default: 1s)
+   - ScaleCooldown (default: 5s)
+
+### Test Coverage
+
+11 scaler tests covering:
+- Start/stop lifecycle
+- Load calculation with various scenarios
+- Automatic scale-up on high load
+- Automatic scale-down on low load
+- Cooldown enforcement
+- Force scale up/down operations
+- Metrics collection
+- Event history tracking
+- Callback invocation
+- Configuration defaults validation
+
+### Design Decisions
+
+1. **Capacity-Based Load**: Load is calculated as demand / capacity, providing a normalized metric regardless of worker count.
+
+2. **Asymmetric Thresholds**: Scale-up threshold (0.8) is higher than scale-down threshold (0.2) to create a stability band and prevent oscillation.
+
+3. **Cooldown per Operation**: Each scaling operation (up or down) updates the cooldown timer, preventing rapid successive operations.
+
+4. **Thread-Safe Callbacks**: Callbacks are protected by RWMutex to allow safe registration while scaler is running.
+
+5. **Ring Buffer Events**: Bounded event history prevents unbounded memory growth while preserving recent history.
+
+6. **Delegation to Pool**: Scaler delegates actual scaling to Pool.ScaleUp/ScaleDown, maintaining separation of concerns.
+
+---
+
+*Next Phase: Phase 9 - Blockberry Integration*
