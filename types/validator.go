@@ -37,6 +37,9 @@ type ValidatorSet interface {
 
 	// VerifySignature verifies a signature from the validator at the given index.
 	VerifySignature(validatorIdx uint16, digest Hash, sig Signature) bool
+
+	// Validators returns all validators in the set.
+	Validators() []*Validator
 }
 
 // SimpleValidatorSet is a basic implementation of ValidatorSet.

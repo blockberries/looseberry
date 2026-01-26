@@ -467,4 +467,95 @@ Phase 5 implements the certificate DAG (Directed Acyclic Graph) that maintains c
 
 ---
 
-*Next Phase: Phase 6 - Network Protocol*
+## Phase 6: Network Protocol
+
+**Status:** Completed
+
+### Summary
+
+Phase 6 implements the network protocol layer for communication between validators. This includes message types, network interface definitions, a mock network for testing, and a synchronization manager for catching up nodes that fall behind.
+
+### Files Created
+
+| File | Description |
+|------|-------------|
+| `network/network.go` | Network interface and message type definitions |
+| `network/mock.go` | Mock network implementation for testing |
+| `network/mock_test.go` | Mock network unit tests |
+| `network/sync.go` | Sync manager for node synchronization |
+| `network/sync_test.go` | Sync manager unit tests |
+
+### Interface Update
+
+| File | Change |
+|------|--------|
+| `types/validator.go` | Added `Validators()` to ValidatorSet interface |
+
+### Key Functionality Implemented
+
+1. **Message Types** (`network/network.go`)
+   - BatchMessage, BatchAckMessage, BatchRequestMessage
+   - HeaderMessage, VoteMessage, CertificateMessage
+   - SyncRequest, SyncResponse
+
+2. **Network Interface**
+   - BroadcastBatch/Header/Certificate for all validators
+   - SendVote/BatchAck/SyncRequest/SyncResponse for specific validators
+   - Receive channels for each message type
+   - Start/Stop lifecycle
+
+3. **MockNetwork** (`network/mock.go`)
+   - Full Network interface implementation
+   - Peer connection/disconnection for multi-node testing
+   - Statistics tracking (messages broadcast, sent)
+   - Message injection for test scenarios
+   - Thread-safe with RWMutex
+
+4. **SyncManager** (`network/sync.go`)
+   - RequestSync for requesting certificates from peers
+   - HandleSyncRequest for serving sync requests
+   - HandleSyncResponse for processing received certificates
+   - CatchUp for synchronizing to target round
+   - Automatic batch collection (certificates + referenced batches)
+   - Pending request tracking with timeout cleanup
+   - Periodic sync checks and cleanup loops
+
+5. **Configuration**
+   - Network: BufferSize (1000), SyncBatchSize (100), SyncTimeout (30s)
+   - Sync: SyncInterval (10s), SyncThreshold (5), SyncBatchSize (100)
+
+### Test Coverage
+
+25 network tests covering:
+- Start/stop lifecycle
+- Peer connection/disconnection
+- Batch/header/certificate broadcasting
+- Vote and batch ack sending
+- Sync request/response handling
+- Unknown peer handling
+- Message injection for testing
+- Statistics tracking and reset
+- Sync manager operations
+- Catch-up scenarios
+
+### Design Decisions
+
+1. **Channel-Based Communication**: Messages are delivered via channels, decoupling network handling from processing.
+
+2. **Mock Network for Testing**: Full implementation allows multi-node testing without real P2P infrastructure.
+
+3. **Bidirectional Connection**: Connect() creates bidirectional peer links, matching real network behavior.
+
+4. **Sync Includes Batches**: Sync responses include referenced batches to ensure receivers have complete data.
+
+5. **Pending Request Tracking**: Prevents duplicate requests and enables timeout-based cleanup.
+
+6. **Validators() Interface Addition**: Added to support iterating over validators for peer selection during sync.
+
+### Note on External Integration
+
+The Network interface is designed for integration with glueberry (P2P networking). The MockNetwork serves as both a testing tool and a reference implementation. Production integration would implement the Network interface wrapping glueberry's node API.
+
+---
+
+*Next Phase: Phase 7 - Garbage Collection & Flow Control*
