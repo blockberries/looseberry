@@ -305,6 +305,7 @@ func (l *Looseberry) initializeComponents() error {
 		MaxBatchesPerHeader: l.cfg.Primary.MaxBatchesPerHeader,
 		MaxRoundGap:         l.cfg.Primary.MaxRoundGap,
 		VoteTimeout:         l.cfg.Primary.VoteTimeout,
+		AllowEmptyHeaders:   l.cfg.Primary.AllowEmptyHeaders,
 	}
 	l.primaryNode = primary.New(
 		l.cfg.ValidatorIndex,

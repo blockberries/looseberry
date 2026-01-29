@@ -300,7 +300,10 @@ type Looseberry struct {
     certStore    *CertificateStore
 
     // Transaction validation
-    txValidator  TxValidator  // Application's CheckTx
+    // This wraps the Application's CheckTx method
+    // Called before adding transactions to workers for batching
+    // MUST be deterministic across all validators
+    txValidator  TxValidator
 
     // Network
     network      Network  // glueberry adapter
@@ -310,7 +313,10 @@ type Looseberry struct {
     stopCh       chan struct{}
 }
 
-// TxValidator validates transactions before batching (wraps Application.CheckTx)
+// TxValidator validates transactions before batching
+// This is a wrapper around the Application's CheckTx method
+// In Raspberry integration:
+//   cfg.TxValidator = app.CheckTx
 type TxValidator func(tx []byte) error
 
 // Core interface for blockberry integration
@@ -1058,6 +1064,64 @@ type GCConfig struct {
 type FlowControlConfig struct {
     MaxUncommittedRounds int  // Default: 100 (pause if exceeded)
 }
+```
+
+## Integration with Raspberry
+
+Looseberry integrates into the Raspberry blockchain node as the DAG mempool for validators. The integration involves:
+
+### Transaction Validation Flow
+
+```
+1. Transaction arrives (RPC or TransactionsReactor)
+   ↓
+2. Looseberry.AddTx(tx)
+   ↓
+3. TxValidator(tx)  ← wraps Application.CheckTx()
+   ├─ Invalid: reject, return error
+   └─ Valid: continue
+   ↓
+4. Route to Worker based on hash(tx) % workerCount
+   ↓
+5. Worker batches and broadcasts to peer workers
+   ↓
+6. Primary creates headers and collects votes
+   ↓
+7. Certificate formed (2f+1 votes)
+   ↓
+8. Leaderberry.ReapCertifiedBatches() pulls batches
+   ↓
+9. Leaderberry executes via Application.ExecuteTx()
+```
+
+**Key Point**: Transactions are validated TWICE:
+1. **CheckTx** (by Looseberry before batching) - fast validation for mempool admission
+2. **ExecuteTx** (by Application after consensus) - full execution with state changes
+
+This two-phase validation ensures:
+- Invalid transactions are rejected early (before network broadcast)
+- Valid transactions may still fail execution (e.g., insufficient funds discovered during execution)
+- Consensus only orders transactions; execution is application's responsibility
+
+### Configuration
+
+```go
+// In Raspberry validator startup
+app := NewApplication()
+
+looseCfg := looseberry.Config{
+    ValidatorIndex: myIndex,
+
+    // IMPORTANT: Wrap application's CheckTx
+    TxValidator: func(tx []byte) error {
+        ctx := context.Background()
+        return app.CheckTx(ctx, tx)
+    },
+
+    // ... worker, primary, sync config ...
+}
+
+looseMempool, err := looseberry.New(looseCfg, glueNode)
 ```
 
 ## Integration with Blockberry

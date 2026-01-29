@@ -110,6 +110,10 @@ func (w *Worker) Start() error {
 		return types.ErrAlreadyRunning
 	}
 
+	// Reset channels for restart capability
+	w.stopCh = make(chan struct{})
+	w.stoppedCh = make(chan struct{})
+
 	go w.batchLoop()
 	return nil
 }

@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/blockberries/looseberry/types"
 )
 
 // ScalerConfig contains auto-scaler configuration.
@@ -106,8 +108,12 @@ func (s *Scaler) SetScaleDownCallback(cb func(oldWorkers, newWorkers int, load f
 // Start starts the auto-scaler.
 func (s *Scaler) Start() error {
 	if s.running.Swap(true) {
-		return ErrAlreadyRunning
+		return types.ErrAlreadyRunning
 	}
+
+	// Reset channels for restart capability
+	s.stopCh = make(chan struct{})
+	s.stoppedCh = make(chan struct{})
 
 	go s.scalingLoop()
 	return nil
@@ -116,7 +122,7 @@ func (s *Scaler) Start() error {
 // Stop stops the auto-scaler.
 func (s *Scaler) Stop() error {
 	if !s.running.Swap(false) {
-		return ErrNotRunning
+		return types.ErrNotRunning
 	}
 
 	close(s.stopCh)
@@ -315,18 +321,3 @@ func (s *Scaler) ForceScaleDown() bool {
 	return false
 }
 
-// Errors for scaler operations
-var (
-	ErrAlreadyRunning = ErrWorkerAlreadyRunning
-	ErrNotRunning     = ErrWorkerNotRunning
-)
-
-// ErrWorkerAlreadyRunning is returned when trying to start an already running worker.
-var ErrWorkerAlreadyRunning = workerError("worker already running")
-
-// ErrWorkerNotRunning is returned when trying to stop a non-running worker.
-var ErrWorkerNotRunning = workerError("worker not running")
-
-type workerError string
-
-func (e workerError) Error() string { return string(e) }

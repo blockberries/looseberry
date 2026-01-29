@@ -38,6 +38,7 @@ type SyncManager struct {
 	batchStore   store.BatchStore
 	network      Network
 	validatorSet types.ValidatorSet
+	validatorMu  sync.RWMutex // Protects validatorSet
 	cfg          SyncConfig
 
 	// Pending sync requests
@@ -48,6 +49,7 @@ type SyncManager struct {
 	running   atomic.Bool
 	stopCh    chan struct{}
 	stoppedCh chan struct{}
+	wg        sync.WaitGroup // Tracks all goroutines
 
 	// Callbacks
 	onSyncComplete func(fromRound, toRound uint64)
@@ -90,6 +92,11 @@ func (s *SyncManager) Start() error {
 		return types.ErrAlreadyRunning
 	}
 
+	// Reset channels for restart capability
+	s.stopCh = make(chan struct{})
+	s.stoppedCh = make(chan struct{})
+
+	s.wg.Add(2)
 	go s.syncLoop()
 	go s.handleMessages()
 
@@ -103,7 +110,7 @@ func (s *SyncManager) Stop() error {
 	}
 
 	close(s.stopCh)
-	<-s.stoppedCh
+	s.wg.Wait() // Wait for all goroutines to finish
 
 	return nil
 }
@@ -235,7 +242,9 @@ func (s *SyncManager) CatchUp(targetRound uint64) error {
 
 	// Request sync from a random peer
 	// In a real implementation, would try multiple peers
+	s.validatorMu.RLock()
 	validators := s.validatorSet.Validators()
+	s.validatorMu.RUnlock()
 	myID := s.network.ValidatorID()
 
 	for _, v := range validators {
@@ -254,7 +263,7 @@ func (s *SyncManager) CatchUp(targetRound uint64) error {
 
 // syncLoop periodically checks for sync opportunities.
 func (s *SyncManager) syncLoop() {
-	defer close(s.stoppedCh)
+	defer s.wg.Done()
 
 	ticker := time.NewTicker(s.cfg.SyncInterval)
 	defer ticker.Stop()
@@ -295,6 +304,8 @@ func (s *SyncManager) cleanupTimedOutRequests() {
 
 // handleMessages handles incoming sync messages.
 func (s *SyncManager) handleMessages() {
+	defer s.wg.Done()
+
 	syncReqs := s.network.SyncRequests()
 	syncResps := s.network.SyncResponses()
 
@@ -323,5 +334,7 @@ func (s *SyncManager) GetPendingRequestCount() int {
 
 // UpdateValidatorSet updates the validator set.
 func (s *SyncManager) UpdateValidatorSet(vs types.ValidatorSet) {
+	s.validatorMu.Lock()
+	defer s.validatorMu.Unlock()
 	s.validatorSet = vs
 }

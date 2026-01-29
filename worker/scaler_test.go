@@ -35,7 +35,7 @@ func TestScalerStartStop(t *testing.T) {
 	}
 
 	// Double start should fail
-	if err := scaler.Start(); err != ErrAlreadyRunning {
+	if err := scaler.Start(); err != types.ErrAlreadyRunning {
 		t.Errorf("Expected ErrAlreadyRunning, got: %v", err)
 	}
 
@@ -48,7 +48,7 @@ func TestScalerStartStop(t *testing.T) {
 	}
 
 	// Double stop should fail
-	if err := scaler.Stop(); err != ErrNotRunning {
+	if err := scaler.Stop(); err != types.ErrNotRunning {
 		t.Errorf("Expected ErrNotRunning, got: %v", err)
 	}
 }

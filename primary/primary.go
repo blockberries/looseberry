@@ -20,6 +20,8 @@ type Config struct {
 	VoteTimeout time.Duration
 	// MaxRoundGap is the maximum allowed round gap for headers.
 	MaxRoundGap uint64
+	// AllowEmptyHeaders allows creating headers with no batches for liveness.
+	AllowEmptyHeaders bool
 }
 
 // DefaultConfig returns default primary configuration.
@@ -29,6 +31,7 @@ func DefaultConfig() Config {
 		MaxBatchesPerHeader: 100,
 		VoteTimeout:         30 * time.Second,
 		MaxRoundGap:         10,
+		AllowEmptyHeaders:   true,
 	}
 }
 
@@ -124,6 +127,10 @@ func (p *Primary) Start() error {
 	if p.running.Swap(true) {
 		return types.ErrAlreadyRunning
 	}
+
+	// Reset channels for restart capability
+	p.stopCh = make(chan struct{})
+	p.stoppedCh = make(chan struct{})
 
 	go p.headerLoop()
 	return nil
@@ -347,21 +354,30 @@ func (p *Primary) tryCreateHeader() {
 
 	// Get batch digests
 	p.digestsMu.Lock()
-	if len(p.batchDigests) == 0 {
+	if len(p.batchDigests) == 0 && !p.cfg.AllowEmptyHeaders {
 		p.digestsMu.Unlock()
 		return
 	}
 
 	// Take up to MaxBatchesPerHeader
-	count := min(len(p.batchDigests), p.cfg.MaxBatchesPerHeader)
-	digests := make([]types.BatchDigest, count)
-	copy(digests, p.batchDigests[:count])
-	p.batchDigests = p.batchDigests[count:]
+	var digests []types.BatchDigest
+	if len(p.batchDigests) > 0 {
+		count := min(len(p.batchDigests), p.cfg.MaxBatchesPerHeader)
+		digests = make([]types.BatchDigest, count)
+		copy(digests, p.batchDigests[:count])
+		p.batchDigests = p.batchDigests[count:]
+	}
 	p.digestsMu.Unlock()
 
 	// Build header
 	round := p.currentRound.Load()
 	parents := p.selectParents(round)
+
+	// For round 0 or when we don't have enough parents, skip unless we have batches
+	// Empty headers for liveness still need valid parent references (except for round 0)
+	if round > 0 && len(parents) == 0 && len(digests) == 0 {
+		return
+	}
 
 	header := types.NewHeader(p.validatorID, round, p.epoch.Load(), digests, parents)
 	if err := header.Sign(p.signer); err != nil {

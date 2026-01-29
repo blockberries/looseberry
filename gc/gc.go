@@ -42,6 +42,8 @@ type GCManager struct {
 
 	// Committed round tracking
 	committedRound atomic.Uint64
+	// Last GC'd round - used to avoid re-scanning already GC'd rounds
+	lastGCRound atomic.Uint64
 
 	// Transaction recovery
 	txRecoveryCallback TxRecoveryCallback
@@ -82,6 +84,10 @@ func (gc *GCManager) Start() error {
 	if gc.running.Swap(true) {
 		return types.ErrAlreadyRunning
 	}
+
+	// Reset channels for restart capability
+	gc.stopCh = make(chan struct{})
+	gc.stoppedCh = make(chan struct{})
 
 	go gc.gcLoop()
 	return nil
@@ -166,6 +172,11 @@ func (gc *GCManager) performGC(beforeRound uint64) error {
 		}
 	}
 
+	// Update last GC'd round
+	if beforeRound > 0 {
+		gc.lastGCRound.Store(beforeRound - 1)
+	}
+
 	return nil
 }
 
@@ -174,7 +185,13 @@ func (gc *GCManager) performGC(beforeRound uint64) error {
 func (gc *GCManager) extractUncommittedTxs(beforeRound uint64) []types.Transaction {
 	var uncommittedTxs []types.Transaction
 
-	for round := uint64(0); round < beforeRound; round++ {
+	// Start from last GC'd round to avoid re-scanning already processed rounds
+	startRound := gc.lastGCRound.Load()
+	if startRound > 0 {
+		startRound++ // Start from the round after the last GC'd round
+	}
+
+	for round := startRound; round < beforeRound; round++ {
 		// Get all batches for this round
 		batches, err := gc.batchStore.GetBatchesByRound(round)
 		if err != nil || len(batches) == 0 {
