@@ -270,5 +270,113 @@ workerIdx := int(hashValue % uint64(len(p.workers)))
 
 ### Status
 
+The codebase was production-ready.
+
+---
+
+## Fourth Iteration Review (2026-01-29)
+
+### Summary
+
+Performed comprehensive review focusing on new patterns from the updated skill:
+- Timer/resource leaks (time.After in select)
+- Crypto/key material handling
+- Config validation and initialization ordering
+- Shallow copy and data isolation issues
+
+### Issues Found and Fixed
+
+#### Issue 12: DAG.GetCertificatesForRound() Returns Uncloned Certificates
+
+**File**: `dag/dag.go`
+**Severity**: High (Data Isolation)
+**Status**: FIXED
+
+**Description**: `GetCertificatesForRound()` called `rd.GetAllCertificates()` which returned certificate pointers directly without cloning. External callers could modify the internal DAG state.
+
+**Fix Applied**: Added cloning loop before returning certificates:
+```go
+certs := rd.GetAllCertificates()
+cloned := make([]*types.Certificate, len(certs))
+for i, cert := range certs {
+    cloned[i] = cert.Clone()
+}
+return cloned
+```
+
+---
+
+#### Issue 13: DAG.GetCertificateForValidator() Returns Uncloned Certificate
+
+**File**: `dag/dag.go`
+**Severity**: High (Data Isolation)
+**Status**: FIXED
+
+**Description**: `GetCertificateForValidator()` returned the certificate directly from `rd.GetCertificate()` without cloning, allowing external modification of internal state.
+
+**Fix Applied**: Added `cert.Clone()` before returning:
+```go
+cert, ok := rd.GetCertificate(validator)
+if !ok {
+    return nil, false
+}
+return cert.Clone(), true
+```
+
+---
+
+#### Issue 14: AckTracker.GetPending() Returns Uncloned PendingBatch
+
+**File**: `worker/ack_tracker.go`
+**Severity**: Medium (Data Isolation)
+**Status**: FIXED
+
+**Description**: `GetPending()` returned the internal `PendingBatch` directly, exposing the mutable `Acks` map to external modification.
+
+**Fix Applied**: Clone both the Batch and the Acks map before returning:
+```go
+acksCopy := make(map[uint16]bool, len(pending.Acks))
+for k, v := range pending.Acks {
+    acksCopy[k] = v
+}
+return &PendingBatch{
+    Batch:     pending.Batch.Clone(),
+    Acks:      acksCopy,
+    CreatedAt: pending.CreatedAt,
+}, true
+```
+
+---
+
+### False Positives Identified
+
+The following issues from the review were determined to be false positives:
+
+1. **Lock ordering in Start()**: The pattern of `running.Swap(true)` before `l.mu.Lock()` is intentional for fail-fast semantics. The atomic swap prevents concurrent Start() calls, then the lock protects initialization.
+
+2. **Private key not zeroed after use**: While technically true, this is a design choice common in Go crypto libraries. The key is unexported and Go lacks a secure memory erasure API. For a mempool module, this is acceptable.
+
+3. **Key import validation**: The standard library `ed25519.GenerateKey` handles validation. Additional validation would be redundant.
+
+4. **Empty signature check before verify**: The existing `ed25519.Verify()` correctly rejects empty signatures, making explicit pre-checks unnecessary.
+
+---
+
+### Resolution Log Update
+
+| Date | Issue | Status | Files Modified |
+|------|-------|--------|----------------|
+| 2026-01-29 | Issue 12: DAG GetCertificatesForRound uncloned | FIXED | dag/dag.go |
+| 2026-01-29 | Issue 13: DAG GetCertificateForValidator uncloned | FIXED | dag/dag.go |
+| 2026-01-29 | Issue 14: AckTracker GetPending uncloned | FIXED | worker/ack_tracker.go |
+
+### Verification Results
+
+- **Build**: Passes with no errors
+- **Tests**: All tests pass with race detection enabled
+- **Lint**: golangci-lint passes with no issues
+
+### Status
+
 The codebase is now production-ready.
 

@@ -217,7 +217,13 @@ func (d *DAG) GetCertificatesForRound(round uint64) []*types.Certificate {
 		return nil
 	}
 
-	return rd.GetAllCertificates()
+	// Clone certificates to prevent external modification of internal state
+	certs := rd.GetAllCertificates()
+	cloned := make([]*types.Certificate, len(certs))
+	for i, cert := range certs {
+		cloned[i] = cert.Clone()
+	}
+	return cloned
 }
 
 // GetCertificateForValidator returns the certificate from a specific validator at a round.
@@ -237,7 +243,12 @@ func (d *DAG) GetCertificateForValidator(round uint64, validator uint16) (*types
 		return nil, false
 	}
 
-	return rd.GetCertificate(validator)
+	cert, ok := rd.GetCertificate(validator)
+	if !ok {
+		return nil, false
+	}
+	// Clone certificate to prevent external modification of internal state
+	return cert.Clone(), true
 }
 
 // HighestRound returns the highest round in the DAG.

@@ -95,7 +95,8 @@ func (at *AckTracker) HasQuorum(batchDigest types.Hash) bool {
 	return len(pending.Acks) >= at.quorum
 }
 
-// GetPending returns a pending batch if it exists.
+// GetPending returns a copy of a pending batch if it exists.
+// The returned copy is safe to use without affecting internal state.
 func (at *AckTracker) GetPending(batchDigest types.Hash) (*PendingBatch, bool) {
 	at.mu.RLock()
 	defer at.mu.RUnlock()
@@ -105,7 +106,17 @@ func (at *AckTracker) GetPending(batchDigest types.Hash) (*PendingBatch, bool) {
 		return nil, false
 	}
 
-	return pending, true
+	// Clone to prevent external modification of internal state
+	acksCopy := make(map[uint16]bool, len(pending.Acks))
+	for k, v := range pending.Acks {
+		acksCopy[k] = v
+	}
+
+	return &PendingBatch{
+		Batch:     pending.Batch.Clone(),
+		Acks:      acksCopy,
+		CreatedAt: pending.CreatedAt,
+	}, true
 }
 
 // RemoveBatch removes a batch from tracking.
