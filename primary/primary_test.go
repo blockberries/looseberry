@@ -393,7 +393,11 @@ func TestPrimaryPendingVotes(t *testing.T) {
 
 	// Votes should be buffered
 	p.pendingMu.Lock()
-	pendingCount := len(p.pendingVotes[futureDigest])
+	entry := p.pendingVotes[futureDigest]
+	pendingCount := 0
+	if entry != nil {
+		pendingCount = len(entry.votes)
+	}
 	p.pendingMu.Unlock()
 
 	if pendingCount != 3 {

@@ -1102,3 +1102,56 @@ The roadmap was developed through systematic analysis of all packages:
 ---
 
 *Roadmap completed. Looseberry has a clear path to production readiness.*
+
+---
+
+## Third Bug Iteration (2026-01-29)
+
+**Status:** Completed
+
+### Summary
+
+Comprehensive multi-agent code review was performed to identify and fix remaining production-critical bugs. Five issues were found and fixed.
+
+### Issues Fixed
+
+1. **Primary.HandleVote nil check** (Critical)
+   - Added nil check at function entry to prevent panic
+
+2. **SyncManager.HandleSyncResponse certificate verification** (Critical - Security)
+   - Added certificate signature verification before storing in DAG
+   - Updated test to create certificates with proper quorum
+
+3. **Primary.UpdateValidatorSet race condition** (High)
+   - Added `validatorMu sync.RWMutex` to protect validatorSet field
+   - Protected all reads/writes across HandleVote, HandleCertificate, tryAdvanceRound, selectParents, processPendingVotes, and validateHeader
+
+4. **Worker pool routing hash function** (High)
+   - Changed from single-byte hash (`txHash[0]`) to 8-byte hash
+   - Uses `binary.BigEndian.Uint64(txHash[:8])` for better distribution
+   - Prevents DoS attacks targeting specific workers
+
+5. **Unbounded pendingVotes map** (Medium - Memory Leak)
+   - Changed pendingVotes to track creation timestamps
+   - Added `cleanupPendingVotes()` method for periodic cleanup
+   - Added cleanup ticker in headerLoop
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `primary/primary.go` | Nil check, validatorMu mutex, pendingVoteEntry struct, cleanup |
+| `primary/primary_test.go` | Updated test for new pendingVotes type |
+| `network/sync.go` | Certificate verification before DAG storage |
+| `network/sync_test.go` | Added createTestCertificateWithQuorum helper |
+| `worker/pool.go` | Improved hash-based routing |
+
+### Verification
+
+- **Build**: Passes with no errors
+- **Tests**: All tests pass with race detection enabled
+- **Lint**: golangci-lint passes with no issues
+
+### Status
+
+The codebase is now production-ready.

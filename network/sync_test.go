@@ -31,6 +31,28 @@ func createTestValidatorSet(t *testing.T, count int) (*types.SimpleValidatorSet,
 	return vs, signers
 }
 
+// createTestCertificateWithQuorum creates a certificate with proper quorum for testing.
+func createTestCertificateWithQuorum(t *testing.T, author uint16, round uint64, signers []*types.Ed25519Signer, quorum int) *types.Certificate {
+	t.Helper()
+
+	header := types.NewHeader(author, round, 0, nil, nil)
+	if err := header.Sign(signers[author]); err != nil {
+		t.Fatalf("Failed to sign header: %v", err)
+	}
+
+	// Create votes from enough signers to meet quorum
+	votes := make([]types.Vote, quorum)
+	for i := range quorum {
+		vote := types.NewVote(header.Digest, uint16(i))
+		if err := vote.Sign(signers[i]); err != nil {
+			t.Fatalf("Failed to sign vote: %v", err)
+		}
+		votes[i] = *vote
+	}
+
+	return types.NewCertificate(header, votes)
+}
+
 func createTestCertificateWithBatches(t *testing.T, author uint16, round uint64, batchDigests []types.Hash) *types.Certificate {
 	t.Helper()
 	signer, err := types.GenerateEd25519Signer(author)
@@ -264,7 +286,7 @@ func TestSyncManagerHandleSyncResponse(t *testing.T) {
 
 	d := dag.New(certStore, dag.DefaultConfig())
 	network := NewMockNetwork(0, DefaultConfig())
-	vs, _ := createTestValidatorSet(t, 4)
+	vs, signers := createTestValidatorSet(t, 4)
 
 	sm := NewSyncManager(d, batchStore, network, vs, DefaultSyncConfig())
 	_ = network.Start()
@@ -275,8 +297,8 @@ func TestSyncManagerHandleSyncResponse(t *testing.T) {
 	}
 	defer func() { _ = sm.Stop() }()
 
-	// Create sync response
-	cert := createTestCertificate(t, 0, 10)
+	// Create sync response with properly signed certificate
+	cert := createTestCertificateWithQuorum(t, 0, 10, signers, vs.Quorum())
 	batch := createTestBatch(t, 0, 0, 10)
 	resp := &SyncResponse{
 		Certificates: []*types.Certificate{cert},

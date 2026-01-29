@@ -211,8 +211,16 @@ func (s *SyncManager) HandleSyncResponse(resp *SyncResponse, from uint16) error 
 		}
 	}
 
-	// Store certificates
+	// Verify and store certificates
+	s.validatorMu.RLock()
+	vs := s.validatorSet
+	s.validatorMu.RUnlock()
+
 	for _, cert := range resp.Certificates {
+		// Verify certificate before adding to DAG (security critical)
+		if err := cert.Verify(vs); err != nil {
+			return err
+		}
 		if err := s.dag.AddCertificate(cert); err != nil {
 			// Ignore duplicate errors
 			if err != types.ErrDuplicateHeader {

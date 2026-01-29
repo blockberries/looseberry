@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 
@@ -153,9 +154,10 @@ func (p *Pool) AddTx(tx types.Transaction) error {
 		return types.ErrNotRunning
 	}
 
-	// Route to worker based on tx hash
+	// Route to worker based on tx hash using more bytes for better distribution
 	txHash := tx.Hash()
-	workerIdx := int(txHash[0]) % len(p.workers)
+	hashValue := binary.BigEndian.Uint64(txHash[:8])
+	workerIdx := int(hashValue % uint64(len(p.workers)))
 	worker := p.workers[workerIdx]
 	p.workersMu.RUnlock()
 

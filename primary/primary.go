@@ -44,6 +44,12 @@ type HeaderCallback func(header *types.Header)
 // VoteCallback is called when a vote should be sent.
 type VoteCallback func(vote *types.Vote, to uint16)
 
+// pendingVoteEntry tracks buffered votes with their creation time for cleanup.
+type pendingVoteEntry struct {
+	votes     []types.Vote
+	createdAt time.Time
+}
+
 // Primary handles header creation, voting, and certificate formation.
 type Primary struct {
 	validatorID uint16
@@ -61,9 +67,10 @@ type Primary struct {
 	// Vote tracking
 	voteTracker *VoteTracker
 
-	// Pending votes for unknown headers
-	pendingVotes map[types.Hash][]types.Vote
-	pendingMu    sync.Mutex
+	// Pending votes for unknown headers (with timestamps for cleanup)
+	pendingVotes   map[types.Hash]*pendingVoteEntry
+	pendingMu      sync.Mutex
+	maxPendingAge  time.Duration // Max age before cleanup (default: 2 * VoteTimeout)
 
 	// Storage
 	certStore  store.CertificateStore
@@ -71,6 +78,7 @@ type Primary struct {
 
 	// Validator set
 	validatorSet types.ValidatorSet
+	validatorMu  sync.RWMutex // Protects validatorSet
 
 	// Callbacks
 	certCallback   CertificateCallback
@@ -93,17 +101,18 @@ func New(
 	validatorSet types.ValidatorSet,
 ) *Primary {
 	return &Primary{
-		validatorID:  validatorID,
-		signer:       signer,
-		cfg:          cfg,
-		batchDigests: make([]types.BatchDigest, 0),
-		voteTracker:  NewVoteTracker(cfg.VoteTimeout),
-		pendingVotes: make(map[types.Hash][]types.Vote),
-		certStore:    certStore,
-		batchStore:   batchStore,
-		validatorSet: validatorSet,
-		stopCh:       make(chan struct{}),
-		stoppedCh:    make(chan struct{}),
+		validatorID:   validatorID,
+		signer:        signer,
+		cfg:           cfg,
+		batchDigests:  make([]types.BatchDigest, 0),
+		voteTracker:   NewVoteTracker(cfg.VoteTimeout),
+		pendingVotes:  make(map[types.Hash]*pendingVoteEntry),
+		maxPendingAge: 2 * cfg.VoteTimeout,
+		certStore:     certStore,
+		batchStore:    batchStore,
+		validatorSet:  validatorSet,
+		stopCh:        make(chan struct{}),
+		stoppedCh:     make(chan struct{}),
 	}
 }
 
@@ -181,6 +190,8 @@ func (p *Primary) Epoch() uint64 {
 
 // UpdateValidatorSet updates the validator set.
 func (p *Primary) UpdateValidatorSet(vs types.ValidatorSet) {
+	p.validatorMu.Lock()
+	defer p.validatorMu.Unlock()
 	p.validatorSet = vs
 }
 
@@ -235,12 +246,18 @@ func (p *Primary) HandleHeader(header *types.Header) error {
 // HandleVote processes a received vote.
 // Returns (certificate, true) if quorum reached.
 func (p *Primary) HandleVote(vote *types.Vote) (*types.Certificate, bool) {
+	if vote == nil {
+		return nil, false
+	}
+
 	if !p.running.Load() {
 		return nil, false
 	}
 
 	// Validate vote signature
+	p.validatorMu.RLock()
 	validator := p.validatorSet.GetByIndex(vote.Validator)
+	p.validatorMu.RUnlock()
 	if validator == nil {
 		return nil, false
 	}
@@ -252,14 +269,23 @@ func (p *Primary) HandleVote(vote *types.Vote) (*types.Certificate, bool) {
 	if !p.voteTracker.HasHeader(vote.HeaderDigest) {
 		// Buffer vote for later
 		p.pendingMu.Lock()
-		p.pendingVotes[vote.HeaderDigest] = append(
-			p.pendingVotes[vote.HeaderDigest], *vote)
+		entry := p.pendingVotes[vote.HeaderDigest]
+		if entry == nil {
+			entry = &pendingVoteEntry{
+				votes:     make([]types.Vote, 0),
+				createdAt: time.Now(),
+			}
+			p.pendingVotes[vote.HeaderDigest] = entry
+		}
+		entry.votes = append(entry.votes, *vote)
 		p.pendingMu.Unlock()
 		return nil, false
 	}
 
 	// Record vote
+	p.validatorMu.RLock()
 	quorum := p.validatorSet.Quorum()
+	p.validatorMu.RUnlock()
 	cert, formed := p.voteTracker.RecordVote(vote, quorum)
 	if formed {
 		// Store certificate
@@ -288,7 +314,10 @@ func (p *Primary) HandleCertificate(cert *types.Certificate) error {
 	}
 
 	// Verify certificate
-	if err := cert.Verify(p.validatorSet); err != nil {
+	p.validatorMu.RLock()
+	vs := p.validatorSet
+	p.validatorMu.RUnlock()
+	if err := cert.Verify(vs); err != nil {
 		return err
 	}
 
@@ -317,10 +346,16 @@ func (p *Primary) headerLoop() {
 	ticker := time.NewTicker(p.cfg.HeaderTimeout)
 	defer ticker.Stop()
 
+	// Cleanup ticker runs at 2x the cleanup interval
+	cleanupTicker := time.NewTicker(p.maxPendingAge)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 			p.tryCreateHeader()
+		case <-cleanupTicker.C:
+			p.cleanupPendingVotes()
 		case <-p.stopCh:
 			return
 		}
@@ -338,7 +373,10 @@ func (p *Primary) tryAdvanceRound() bool {
 	}
 
 	// Need quorum to advance
-	if len(certs) >= p.validatorSet.Quorum() {
+	p.validatorMu.RLock()
+	quorum := p.validatorSet.Quorum()
+	p.validatorMu.RUnlock()
+	if len(certs) >= quorum {
 		p.currentRound.Store(currentRound + 1)
 		return true
 	}
@@ -414,7 +452,9 @@ func (p *Primary) selectParents(round uint64) []types.CertificateRef {
 	})
 
 	// Take up to quorum
+	p.validatorMu.RLock()
 	quorum := p.validatorSet.Quorum()
+	p.validatorMu.RUnlock()
 	if len(certs) > quorum {
 		certs = certs[:quorum]
 	}
@@ -431,18 +471,20 @@ func (p *Primary) selectParents(round uint64) []types.CertificateRef {
 // processPendingVotes processes any buffered votes for a header.
 func (p *Primary) processPendingVotes(headerDigest types.Hash) {
 	p.pendingMu.Lock()
-	votes, exists := p.pendingVotes[headerDigest]
+	entry, exists := p.pendingVotes[headerDigest]
 	if exists {
 		delete(p.pendingVotes, headerDigest)
 	}
 	p.pendingMu.Unlock()
 
-	if !exists {
+	if !exists || entry == nil {
 		return
 	}
 
+	p.validatorMu.RLock()
 	quorum := p.validatorSet.Quorum()
-	for _, vote := range votes {
+	p.validatorMu.RUnlock()
+	for _, vote := range entry.votes {
 		cert, formed := p.voteTracker.RecordVote(&vote, quorum)
 		if formed {
 			// Store certificate
@@ -459,6 +501,19 @@ func (p *Primary) processPendingVotes(headerDigest types.Hash) {
 			}
 
 			return
+		}
+	}
+}
+
+// cleanupPendingVotes removes old pending vote entries to prevent memory leaks.
+func (p *Primary) cleanupPendingVotes() {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+
+	cutoff := time.Now().Add(-p.maxPendingAge)
+	for digest, entry := range p.pendingVotes {
+		if entry.createdAt.Before(cutoff) {
+			delete(p.pendingVotes, digest)
 		}
 	}
 }
@@ -480,7 +535,10 @@ func (p *Primary) validateHeader(header *types.Header) error {
 	}
 
 	// Verify author signature
+	p.validatorMu.RLock()
 	author := p.validatorSet.GetByIndex(header.Author)
+	quorum := p.validatorSet.Quorum()
+	p.validatorMu.RUnlock()
 	if author == nil {
 		return types.ErrValidatorNotFound
 	}
@@ -490,7 +548,7 @@ func (p *Primary) validateHeader(header *types.Header) error {
 
 	// For round > 0, verify parent count (should have quorum)
 	if header.Round > 0 {
-		if len(header.Parents) < p.validatorSet.Quorum() {
+		if len(header.Parents) < quorum {
 			return types.ErrMissingParents
 		}
 
