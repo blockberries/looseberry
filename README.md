@@ -550,11 +550,34 @@ looseberry/
 └── *_test.go           # Unit tests
 ```
 
-## Related Documentation
+## Documentation
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Detailed system architecture
-- [CHANGELOG.md](docs/CHANGELOG.md) - Release notes and version history
-- [CODE_REVIEW.md](docs/CODE_REVIEW.md) - Code review notes
+### Core Documentation
+- [Documentation Index](docs/INDEX.md) - Complete documentation navigation
+- [API Reference](docs/API.md) - Complete API documentation with examples
+- [Architecture](docs/ARCHITECTURE.md) - Detailed system architecture and design
+- [Changelog](docs/CHANGELOG.md) - Release notes and version history
+
+### Getting Started
+- [Quickstart Tutorial](docs/tutorials/QUICKSTART.md) - Get up and running in 5 minutes
+- [Getting Started Guide](docs/guides/GETTING_STARTED.md) - Installation and first steps
+- [Integration Guide](docs/guides/INTEGRATION.md) - Integrating with consensus systems
+
+### Configuration and Deployment
+- [Configuration Guide](docs/guides/CONFIGURATION.md) - Detailed configuration options
+- [Deployment Guide](docs/guides/DEPLOYMENT.md) - Production deployment best practices
+- [Monitoring Guide](docs/guides/MONITORING.md) - Metrics and observability
+
+### Advanced Topics
+- [Performance Tuning](docs/tutorials/PERFORMANCE_TUNING.md) - Optimization strategies
+- [Custom Storage](docs/tutorials/CUSTOM_STORAGE.md) - Implementing storage backends
+- [Concurrency Patterns](docs/reference/CONCURRENCY.md) - Thread-safety and goroutines
+- [Security Reference](docs/reference/SECURITY.md) - BFT guarantees and best practices
+
+### Support
+- [Troubleshooting](docs/reference/TROUBLESHOOTING.md) - Common issues and solutions
+- [FAQ](docs/reference/FAQ.md) - Frequently asked questions
+- [Error Handling](docs/reference/ERROR_HANDLING.md) - Error types and patterns
 
 ## License
 
