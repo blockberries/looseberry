@@ -1,4 +1,4 @@
-package looseberry
+package looseberry_test
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blockberries/looseberry"
 	"github.com/blockberries/looseberry/network"
 	"github.com/blockberries/looseberry/store"
 	"github.com/blockberries/looseberry/types"
@@ -14,7 +15,7 @@ import (
 // TestNode represents a single node in the test network.
 type TestNode struct {
 	Index       uint16
-	Looseberry  *Looseberry
+	Looseberry  *looseberry.Looseberry
 	Network     *network.MockNetwork
 	Signer      *types.Ed25519Signer
 	BatchStore  store.BatchStore
@@ -88,12 +89,12 @@ func (tn *TestNetwork) createNode(t *testing.T, index uint16) (*TestNode, error)
 
 	signer := tn.signers[index]
 
-	cfg := DefaultConfig()
+	cfg := looseberry.DefaultConfig()
 	cfg.Signer = signer
 	cfg.ValidatorIndex = index
 	cfg.Storage.InMemory = true
 
-	lb, err := New(cfg)
+	lb, err := looseberry.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create Looseberry: %w", err)
 	}
@@ -262,11 +263,11 @@ func (tn *TestNetwork) WaitForBatches(count int, timeout time.Duration) error {
 }
 
 // GetMetrics returns metrics from all nodes.
-func (tn *TestNetwork) GetMetrics() []*Metrics {
+func (tn *TestNetwork) GetMetrics() []*looseberry.Metrics {
 	tn.mu.RLock()
 	defer tn.mu.RUnlock()
 
-	metrics := make([]*Metrics, len(tn.nodes))
+	metrics := make([]*looseberry.Metrics, len(tn.nodes))
 	for i, node := range tn.nodes {
 		metrics[i] = node.Looseberry.Metrics()
 	}

@@ -538,18 +538,23 @@ looseberry/
 │   ├── network.go
 │   ├── mock.go
 │   └── sync.go
-├── *_test.go           # Unit tests
-├── integration_test.go # Multi-node tests
-├── benchmark_test.go   # Performance benchmarks
-├── stress_test.go      # High-volume tests
-└── byzantine_test.go   # BFT safety tests
+├── test/               # Integration and system tests
+│   ├── integration_test.go # Multi-node tests
+│   ├── benchmark_test.go   # Performance benchmarks
+│   ├── stress_test.go      # High-volume tests
+│   └── byzantine_test.go   # BFT safety tests
+├── docs/               # Documentation
+│   ├── ARCHITECTURE.md     # System architecture
+│   ├── CHANGELOG.md        # Release notes
+│   └── CODE_REVIEW.md      # Code review notes
+└── *_test.go           # Unit tests
 ```
 
 ## Related Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed system architecture
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) - Development phases
-- [PROGRESS_REPORT.md](PROGRESS_REPORT.md) - Implementation status
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Detailed system architecture
+- [CHANGELOG.md](docs/CHANGELOG.md) - Release notes and version history
+- [CODE_REVIEW.md](docs/CODE_REVIEW.md) - Code review notes
 
 ## License
 

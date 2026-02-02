@@ -1,9 +1,10 @@
-package looseberry
+package looseberry_test
 
 import (
 	"fmt"
 	"testing"
 
+	"github.com/blockberries/looseberry"
 	"github.com/blockberries/looseberry/dag"
 	"github.com/blockberries/looseberry/network"
 	"github.com/blockberries/looseberry/store"
@@ -333,12 +334,12 @@ func BenchmarkLooseberryAddTx(b *testing.B) {
 
 	vs := types.NewSimpleValidatorSet(validators, 0)
 
-	cfg := DefaultConfig()
+	cfg := looseberry.DefaultConfig()
 	cfg.Signer = signers[0]
 	cfg.ValidatorIndex = 0
 	cfg.Storage.InMemory = true
 
-	lb, _ := New(cfg)
+	lb, _ := looseberry.New(cfg)
 	lb.SetValidatorSet(vs)
 	net := network.NewMockNetwork(0, network.DefaultConfig())
 	lb.SetNetwork(net)
@@ -373,12 +374,12 @@ func BenchmarkLooseberryAddTxParallel(b *testing.B) {
 
 	vs := types.NewSimpleValidatorSet(validators, 0)
 
-	cfg := DefaultConfig()
+	cfg := looseberry.DefaultConfig()
 	cfg.Signer = signers[0]
 	cfg.ValidatorIndex = 0
 	cfg.Storage.InMemory = true
 
-	lb, _ := New(cfg)
+	lb, _ := looseberry.New(cfg)
 	lb.SetValidatorSet(vs)
 	net := network.NewMockNetwork(0, network.DefaultConfig())
 	lb.SetNetwork(net)
@@ -412,12 +413,12 @@ func BenchmarkLooseberryMetrics(b *testing.B) {
 
 	vs := types.NewSimpleValidatorSet(validators, 0)
 
-	cfg := DefaultConfig()
+	cfg := looseberry.DefaultConfig()
 	cfg.Signer = signers[0]
 	cfg.ValidatorIndex = 0
 	cfg.Storage.InMemory = true
 
-	lb, _ := New(cfg)
+	lb, _ := looseberry.New(cfg)
 	lb.SetValidatorSet(vs)
 	net := network.NewMockNetwork(0, network.DefaultConfig())
 	lb.SetNetwork(net)

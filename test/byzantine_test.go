@@ -1,10 +1,11 @@
-package looseberry
+package looseberry_test
 
 import (
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/blockberries/looseberry"
 	"github.com/blockberries/looseberry/network"
 	"github.com/blockberries/looseberry/primary"
 	"github.com/blockberries/looseberry/store"
@@ -795,12 +796,12 @@ func TestByzantineLivenessWithHonestMajority(t *testing.T) {
 
 	vs := types.NewSimpleValidatorSet(validators, 0)
 
-	cfg := DefaultConfig()
+	cfg := looseberry.DefaultConfig()
 	cfg.Signer = signers[0]
 	cfg.ValidatorIndex = 0
 	cfg.Storage.InMemory = true
 
-	lb, err := New(cfg)
+	lb, err := looseberry.New(cfg)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
