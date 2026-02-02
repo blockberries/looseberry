@@ -203,3 +203,104 @@ func TestMemoryTxIndexClose(t *testing.T) {
 		t.Errorf("GetBatchForTx after close should return ErrNotRunning, got: %v", err)
 	}
 }
+
+// Test for Bug Fix #4: TxIndex Garbage Collection
+func TestMemoryTxIndexPruneOlderThan(t *testing.T) {
+	idx := NewMemoryTxIndex()
+	defer idx.Close()
+
+	// Add batches at different rounds
+	batch0 := types.NewBatch(0, 0, 0, []types.Transaction{
+		types.Transaction([]byte("tx_round0_1")),
+		types.Transaction([]byte("tx_round0_2")),
+	})
+	batch5 := types.NewBatch(0, 0, 5, []types.Transaction{
+		types.Transaction([]byte("tx_round5_1")),
+		types.Transaction([]byte("tx_round5_2")),
+	})
+	batch10 := types.NewBatch(0, 0, 10, []types.Transaction{
+		types.Transaction([]byte("tx_round10_1")),
+		types.Transaction([]byte("tx_round10_2")),
+	})
+
+	_ = idx.AddBatch(batch0)
+	_ = idx.AddBatch(batch5)
+	_ = idx.AddBatch(batch10)
+
+	if idx.Len() != 6 {
+		t.Fatalf("Expected 6 indexed txs, got %d", idx.Len())
+	}
+
+	// Prune batches older than round 6 (should remove batch0 and batch5)
+	pruned, err := idx.PruneOlderThan(6, nil)
+	if err != nil {
+		t.Fatalf("PruneOlderThan failed: %v", err)
+	}
+
+	if pruned != 2 {
+		t.Errorf("Expected 2 batches pruned, got %d", pruned)
+	}
+
+	// batch0 and batch5 transactions should be gone
+	for _, tx := range batch0.Transactions {
+		if idx.HasTx(tx.Hash()) {
+			t.Error("Round 0 transactions should be pruned")
+		}
+	}
+	for _, tx := range batch5.Transactions {
+		if idx.HasTx(tx.Hash()) {
+			t.Error("Round 5 transactions should be pruned")
+		}
+	}
+
+	// batch10 transactions should remain
+	for _, tx := range batch10.Transactions {
+		if !idx.HasTx(tx.Hash()) {
+			t.Error("Round 10 transactions should remain")
+		}
+	}
+
+	if idx.Len() != 2 {
+		t.Errorf("Expected 2 indexed txs after prune, got %d", idx.Len())
+	}
+}
+
+func TestMemoryTxIndexPruneOlderThanEmpty(t *testing.T) {
+	idx := NewMemoryTxIndex()
+	defer idx.Close()
+
+	// Prune empty index should not error
+	pruned, err := idx.PruneOlderThan(10, nil)
+	if err != nil {
+		t.Fatalf("PruneOlderThan on empty index failed: %v", err)
+	}
+
+	if pruned != 0 {
+		t.Errorf("Expected 0 batches pruned from empty index, got %d", pruned)
+	}
+}
+
+func TestMemoryTxIndexPruneOlderThanPreservesNewer(t *testing.T) {
+	idx := NewMemoryTxIndex()
+	defer idx.Close()
+
+	// Add batch at round 100
+	batch := types.NewBatch(0, 0, 100, []types.Transaction{
+		types.Transaction([]byte("tx1")),
+	})
+	_ = idx.AddBatch(batch)
+
+	// Prune rounds older than 50 (should not affect round 100)
+	pruned, err := idx.PruneOlderThan(50, nil)
+	if err != nil {
+		t.Fatalf("PruneOlderThan failed: %v", err)
+	}
+
+	if pruned != 0 {
+		t.Errorf("Expected 0 batches pruned, got %d", pruned)
+	}
+
+	if idx.Len() != 1 {
+		t.Errorf("Expected 1 indexed tx, got %d", idx.Len())
+	}
+}

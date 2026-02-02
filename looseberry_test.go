@@ -629,3 +629,33 @@ func TestLooseberryInterfaceCompliance(t *testing.T) {
 	// Verify interface compliance
 	var _ DAGMempool = lb
 }
+
+// Test Callback Panic Recovery (Performance Optimization #9)
+func TestCallbackPanicRecovery(t *testing.T) {
+	// Test that recoverCallback catches panics and doesn't propagate them
+	testPanic := func() {
+		defer recoverCallback("testPanic")
+		panic("test panic")
+	}
+
+	// This should not panic the test
+	testPanic()
+
+	// If we reach here, recovery worked
+	t.Log("Panic recovery working correctly")
+}
+
+func TestCallbackPanicRecoveryNoPanic(t *testing.T) {
+	// Test that recoverCallback doesn't interfere with normal execution
+	executed := false
+	normalFunc := func() {
+		defer recoverCallback("normalFunc")
+		executed = true
+	}
+
+	normalFunc()
+
+	if !executed {
+		t.Error("Normal function should have executed")
+	}
+}

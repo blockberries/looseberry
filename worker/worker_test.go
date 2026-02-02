@@ -477,6 +477,10 @@ func TestWorkerDefaultConfig(t *testing.T) {
 		t.Error("BatchSize should be positive")
 	}
 
+	if cfg.BatchBytes <= 0 {
+		t.Error("BatchBytes should be positive")
+	}
+
 	if cfg.BatchTimeout <= 0 {
 		t.Error("BatchTimeout should be positive")
 	}
@@ -492,4 +496,228 @@ func TestWorkerDefaultConfig(t *testing.T) {
 	if cfg.AckTimeout <= 0 {
 		t.Error("AckTimeout should be positive")
 	}
+}
+
+// Tests for Bug Fix #1: Batch Creation Triggers
+func TestWorkerBatchCreationOnSizeLimit(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	var createdBatches []*types.Batch
+	var mu sync.Mutex
+
+	cfg := DefaultConfig()
+	cfg.BatchSize = 5                   // Small batch size to trigger quickly
+	cfg.BatchTimeout = 10 * time.Second // Long timeout to ensure we trigger by size
+	w := New(0, 0, cfg, batchStore, txIndex, 3)
+	w.SetBatchCallback(func(batch *types.Batch) {
+		mu.Lock()
+		createdBatches = append(createdBatches, batch)
+		mu.Unlock()
+	})
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = w.Stop() }()
+
+	// Add exactly BatchSize transactions
+	for i := range 5 {
+		tx := types.Transaction([]byte{byte(i)})
+		if err := w.AddTx(tx); err != nil {
+			t.Fatalf("AddTx %d failed: %v", i, err)
+		}
+	}
+
+	// Wait a bit for batch creation (should be immediate due to trigger)
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	batchCount := len(createdBatches)
+	mu.Unlock()
+
+	if batchCount != 1 {
+		t.Errorf("Expected 1 batch to be created by size trigger, got %d", batchCount)
+	}
+
+	if w.PendingCount() != 0 {
+		t.Errorf("Expected 0 pending after batch creation, got %d", w.PendingCount())
+	}
+}
+
+func TestWorkerBatchCreationOnBytesLimit(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	var createdBatches []*types.Batch
+	var mu sync.Mutex
+
+	cfg := DefaultConfig()
+	cfg.BatchSize = 1000                // High count limit
+	cfg.BatchBytes = 50                 // Low byte limit (50 bytes)
+	cfg.BatchTimeout = 10 * time.Second // Long timeout to ensure we trigger by bytes
+	w := New(0, 0, cfg, batchStore, txIndex, 3)
+	w.SetBatchCallback(func(batch *types.Batch) {
+		mu.Lock()
+		createdBatches = append(createdBatches, batch)
+		mu.Unlock()
+	})
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = w.Stop() }()
+
+	// Add transactions until we exceed BatchBytes
+	// Each tx is 20 bytes, so after 3 txs we have 60 bytes >= 50 bytes limit
+	for i := 0; i < 5; i++ {
+		tx := types.Transaction(make([]byte, 20)) // 20 bytes each
+		// Make each tx unique
+		copy(tx, []byte{byte(i), byte(i >> 8)})
+		if err := w.AddTx(tx); err != nil {
+			t.Fatalf("AddTx %d failed: %v", i, err)
+		}
+	}
+
+	// Wait a bit for batch creation
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	batchCount := len(createdBatches)
+	mu.Unlock()
+
+	if batchCount < 1 {
+		t.Errorf("Expected at least 1 batch to be created by bytes trigger, got %d", batchCount)
+	}
+}
+
+// Tests for Bug Fix #2: Storage Failure Recovery
+func TestWorkerStorageFailureRequeue(t *testing.T) {
+	// Create a failing batch store that counts save attempts
+	failingStore := &failingBatchStore{
+		MemoryBatchStore: store.NewMemoryBatchStore(),
+	}
+	failingStore.SetFailing(true)
+	txIndex := store.NewMemoryTxIndex()
+	defer failingStore.Close()
+	defer txIndex.Close()
+
+	var savedBatches []*types.Batch
+	var saveMu sync.Mutex
+
+	cfg := DefaultConfig()
+	cfg.BatchTimeout = 50 * time.Millisecond
+	cfg.BatchSize = 100 // High enough to not trigger by size
+	w := New(0, 0, cfg, failingStore, txIndex, 3)
+	w.SetBatchCallback(func(batch *types.Batch) {
+		saveMu.Lock()
+		savedBatches = append(savedBatches, batch)
+		saveMu.Unlock()
+	})
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Add transactions
+	for i := range 3 {
+		tx := types.Transaction([]byte{byte(i)})
+		_ = w.AddTx(tx)
+	}
+
+	// Wait for batch attempt (will fail)
+	time.Sleep(cfg.BatchTimeout + 50*time.Millisecond)
+
+	// Storage is failing, so batch callback should NOT be called
+	saveMu.Lock()
+	batchCountDuringFailure := len(savedBatches)
+	saveMu.Unlock()
+
+	if batchCountDuringFailure > 0 {
+		t.Error("Batch callback should not be called when storage fails")
+	}
+
+	// Now allow saves to succeed
+	failingStore.SetFailing(false)
+
+	// Wait for successful batch
+	time.Sleep(cfg.BatchTimeout*2 + 100*time.Millisecond)
+
+	// Now batch callback should have been called
+	saveMu.Lock()
+	batchCountAfterSuccess := len(savedBatches)
+	saveMu.Unlock()
+
+	if batchCountAfterSuccess == 0 {
+		t.Error("Batch callback should be called after storage succeeds")
+	}
+
+	// Stop worker
+	_ = w.Stop()
+}
+
+// failingBatchStore is a BatchStore that can be configured to fail
+type failingBatchStore struct {
+	*store.MemoryBatchStore
+	mu         sync.RWMutex
+	shouldFail bool
+}
+
+func (f *failingBatchStore) SetFailing(fail bool) {
+	f.mu.Lock()
+	f.shouldFail = fail
+	f.mu.Unlock()
+}
+
+func (f *failingBatchStore) SaveBatch(batch *types.Batch) error {
+	f.mu.RLock()
+	fail := f.shouldFail
+	f.mu.RUnlock()
+	if fail {
+		return types.ErrInvalidBatch // Simulate storage failure
+	}
+	return f.MemoryBatchStore.SaveBatch(batch)
+}
+
+// Tests for Bug Fix #3: Worker Drain on Scale-Down
+func TestWorkerDrainPending(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	cfg := DefaultConfig()
+	cfg.BatchTimeout = 10 * time.Second // Long timeout to keep txs pending
+	w := New(0, 0, cfg, batchStore, txIndex, 3)
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Add transactions
+	for i := range 5 {
+		tx := types.Transaction([]byte{byte(i)})
+		_ = w.AddTx(tx)
+	}
+
+	if w.PendingCount() != 5 {
+		t.Errorf("Expected 5 pending, got %d", w.PendingCount())
+	}
+
+	// Drain pending
+	drained := w.DrainPending()
+
+	if len(drained) != 5 {
+		t.Errorf("Expected 5 drained transactions, got %d", len(drained))
+	}
+
+	if w.PendingCount() != 0 {
+		t.Errorf("Expected 0 pending after drain, got %d", w.PendingCount())
+	}
+
+	_ = w.Stop()
 }

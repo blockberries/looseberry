@@ -460,3 +460,57 @@ func TestPoolDefaultConfig(t *testing.T) {
 		t.Error("Worker.BatchSize should be positive")
 	}
 }
+
+// Test for Bug Fix #3: Worker Scale-Down Drain
+func TestPoolScaleDownRedistributesTxs(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	cfg := DefaultPoolConfig()
+	cfg.MinWorkers = 1
+	cfg.MaxWorkers = 2
+	cfg.Worker.BatchTimeout = 10 * time.Second // Long timeout to keep txs pending
+	cfg.Worker.MaxPendingTxs = 1000
+
+	pool := NewPool(cfg, 0, batchStore, txIndex, 3)
+
+	if err := pool.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = pool.Stop() }()
+
+	// Scale up to 2 workers
+	pool.ScaleUp()
+	if pool.WorkerCount() != 2 {
+		t.Fatalf("Expected 2 workers, got %d", pool.WorkerCount())
+	}
+
+	// Add many transactions - some will go to each worker
+	for i := range 100 {
+		tx := types.Transaction([]byte{byte(i), byte(i >> 8)})
+		_ = pool.AddTx(tx)
+	}
+
+	initialPending := pool.PendingCount()
+	if initialPending == 0 {
+		t.Fatal("Expected pending transactions")
+	}
+
+	// Scale down - should redistribute transactions from removed worker
+	if !pool.ScaleDown() {
+		t.Fatal("ScaleDown should succeed")
+	}
+
+	if pool.WorkerCount() != 1 {
+		t.Errorf("Expected 1 worker after scale down, got %d", pool.WorkerCount())
+	}
+
+	// Pending count should be preserved (no transaction loss)
+	finalPending := pool.PendingCount()
+	if finalPending < initialPending {
+		t.Errorf("Expected at least %d pending after scale down, got %d (transaction loss!)",
+			initialPending, finalPending)
+	}
+}

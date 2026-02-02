@@ -136,8 +136,42 @@ func (s *Scaler) IsRunning() bool {
 }
 
 // CalculateLoad calculates the current load factor.
-// Load = pending transactions / (worker count * batch size)
+// Load = max(countLoad, byteLoad) where:
+//   - countLoad = pending transactions / (worker count * batch size)
+//   - byteLoad = pending bytes / (worker count * max pending bytes per worker)
+//
+// This ensures scaling decisions consider both transaction count and byte capacity.
 func (s *Scaler) CalculateLoad() float64 {
+	workerCount := s.pool.WorkerCount()
+	if workerCount == 0 {
+		return 0
+	}
+
+	// Calculate count-based load
+	pendingCount := s.pool.PendingCount()
+	countCapacity := float64(workerCount * s.pool.cfg.Worker.BatchSize)
+	var countLoad float64
+	if countCapacity > 0 {
+		countLoad = float64(pendingCount) / countCapacity
+	}
+
+	// Calculate byte-based load
+	pendingBytes := s.pool.PendingBytes()
+	byteCapacity := float64(workerCount) * float64(s.pool.cfg.Worker.MaxPendingBytes)
+	var byteLoad float64
+	if byteCapacity > 0 {
+		byteLoad = float64(pendingBytes) / byteCapacity
+	}
+
+	// Return the maximum of the two - scale up if EITHER is too high
+	if countLoad > byteLoad {
+		return countLoad
+	}
+	return byteLoad
+}
+
+// CalculateCountLoad calculates the transaction count based load factor.
+func (s *Scaler) CalculateCountLoad() float64 {
 	workerCount := s.pool.WorkerCount()
 	if workerCount == 0 {
 		return 0
@@ -151,6 +185,23 @@ func (s *Scaler) CalculateLoad() float64 {
 	}
 
 	return float64(pendingCount) / capacity
+}
+
+// CalculateByteLoad calculates the byte-based load factor.
+func (s *Scaler) CalculateByteLoad() float64 {
+	workerCount := s.pool.WorkerCount()
+	if workerCount == 0 {
+		return 0
+	}
+
+	pendingBytes := s.pool.PendingBytes()
+	capacity := float64(workerCount) * float64(s.pool.cfg.Worker.MaxPendingBytes)
+
+	if capacity == 0 {
+		return 0
+	}
+
+	return float64(pendingBytes) / capacity
 }
 
 // Metrics returns the current scaler metrics.

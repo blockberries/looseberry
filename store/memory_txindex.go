@@ -11,6 +11,7 @@ import (
 type MemoryTxIndex struct {
 	txToBatch    map[types.Hash]types.Hash   // txHash -> batchHash
 	batchToTxs   map[types.Hash][]types.Hash // batchHash -> []txHash
+	batchRounds  map[types.Hash]uint64       // batchHash -> round (for GC)
 	mu           sync.RWMutex
 	closed       bool
 }
@@ -18,8 +19,9 @@ type MemoryTxIndex struct {
 // NewMemoryTxIndex creates a new in-memory transaction index.
 func NewMemoryTxIndex() *MemoryTxIndex {
 	return &MemoryTxIndex{
-		txToBatch:  make(map[types.Hash]types.Hash),
-		batchToTxs: make(map[types.Hash][]types.Hash),
+		txToBatch:   make(map[types.Hash]types.Hash),
+		batchToTxs:  make(map[types.Hash][]types.Hash),
+		batchRounds: make(map[types.Hash]uint64),
 	}
 }
 
@@ -112,6 +114,7 @@ func (idx *MemoryTxIndex) Close() error {
 	idx.closed = true
 	idx.txToBatch = nil
 	idx.batchToTxs = nil
+	idx.batchRounds = nil
 
 	return nil
 }
@@ -134,6 +137,9 @@ func (idx *MemoryTxIndex) AddBatch(batch *types.Batch) error {
 
 	batchHash := batch.Digest
 
+	// Store round for GC
+	idx.batchRounds[batchHash] = batch.Round
+
 	// Index each transaction
 	for _, tx := range batch.Transactions {
 		txHash := tx.Hash()
@@ -152,6 +158,43 @@ func (idx *MemoryTxIndex) AddBatch(batch *types.Batch) error {
 	}
 
 	return nil
+}
+
+// PruneOlderThan removes all transaction mappings for batches older than the given round.
+// The batchStore parameter is not needed for the in-memory implementation but is
+// required by the interface for implementations that don't track rounds internally.
+func (idx *MemoryTxIndex) PruneOlderThan(round uint64, _ BatchStore) (int, error) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if idx.closed {
+		return 0, types.ErrNotRunning
+	}
+
+	var prunedCount int
+	var batchesToPrune []types.Hash
+
+	// Find batches older than the given round
+	for batchHash, batchRound := range idx.batchRounds {
+		if batchRound < round {
+			batchesToPrune = append(batchesToPrune, batchHash)
+		}
+	}
+
+	// Remove transaction mappings for each batch
+	for _, batchHash := range batchesToPrune {
+		txHashes, exists := idx.batchToTxs[batchHash]
+		if exists {
+			for _, txHash := range txHashes {
+				delete(idx.txToBatch, txHash)
+			}
+			delete(idx.batchToTxs, batchHash)
+		}
+		delete(idx.batchRounds, batchHash)
+		prunedCount++
+	}
+
+	return prunedCount, nil
 }
 
 // Verify interface compliance

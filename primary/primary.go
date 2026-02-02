@@ -507,15 +507,19 @@ func (p *Primary) processPendingVotes(headerDigest types.Hash) {
 
 // cleanupPendingVotes removes old pending vote entries to prevent memory leaks.
 func (p *Primary) cleanupPendingVotes() {
+	// Clean up pending votes (votes received before their headers)
 	p.pendingMu.Lock()
-	defer p.pendingMu.Unlock()
-
 	cutoff := time.Now().Add(-p.maxPendingAge)
 	for digest, entry := range p.pendingVotes {
 		if entry.createdAt.Before(cutoff) {
 			delete(p.pendingVotes, digest)
 		}
 	}
+	p.pendingMu.Unlock()
+
+	// Clean up timed-out headers in the vote tracker
+	// This prevents memory leaks from headers that never reached quorum
+	p.voteTracker.RemoveTimedOut()
 }
 
 // validateHeader validates a header.

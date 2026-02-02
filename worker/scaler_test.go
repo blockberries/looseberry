@@ -436,3 +436,120 @@ func TestDefaultScalerConfig(t *testing.T) {
 		t.Error("ScaleCooldown should be positive")
 	}
 }
+
+func TestScalerByteAwareScaling(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	cfg := DefaultPoolConfig()
+	cfg.MinWorkers = 1
+	cfg.MaxWorkers = 4
+	cfg.Worker.BatchSize = 1000              // High batch size (won't trigger count-based scaling)
+	cfg.Worker.MaxPendingBytes = 100         // Low byte limit (will trigger byte-based scaling)
+	cfg.Worker.BatchBytes = 500              // High to prevent batch creation on bytes
+	cfg.Worker.BatchTimeout = 10 * time.Second // Long timeout to prevent batch creation
+	pool := NewPool(cfg, 0, batchStore, txIndex, 3)
+	_ = pool.Start()
+	defer func() { _ = pool.Stop() }()
+
+	scalerCfg := DefaultScalerConfig()
+	scalerCfg.ScaleUpThreshold = 0.5
+	scalerCfg.ScalingInterval = 50 * time.Millisecond
+	scalerCfg.ScaleCooldown = 10 * time.Millisecond
+	scaler := NewScaler(pool, scalerCfg)
+
+	_ = scaler.Start()
+	defer func() { _ = scaler.Stop() }()
+
+	// Track scale events
+	var scaleUpCount atomic.Int32
+	scaler.SetScaleUpCallback(func(old, new int, load float64) {
+		scaleUpCount.Add(1)
+	})
+
+	// Add transactions to trigger byte-based scaling
+	// With MaxPendingBytes = 100 per worker and 1 worker, capacity is 100 bytes
+	// Adding enough bytes should trigger scaling
+	for i := 0; i < 10; i++ {
+		tx := types.Transaction(make([]byte, 10)) // 10 bytes each = 100 bytes total (100% capacity)
+		_ = pool.AddTx(tx)
+	}
+
+	// Verify byte load is being calculated correctly
+	byteLoad := scaler.CalculateByteLoad()
+	if byteLoad < 0.5 {
+		t.Logf("Byte load: %f, pending bytes: %d, max pending bytes: %d",
+			byteLoad, pool.PendingBytes(), cfg.Worker.MaxPendingBytes)
+	}
+
+	// Count load should be low (10 / 1000 = 0.01)
+	countLoad := scaler.CalculateCountLoad()
+	if countLoad > 0.1 {
+		t.Errorf("Expected count load < 0.1, got %f", countLoad)
+	}
+
+	// Wait for scaling to occur
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify that byte load calculation uses the max of count and byte loads
+	load := scaler.CalculateLoad()
+	expectedLoad := countLoad
+	if byteLoad > countLoad {
+		expectedLoad = byteLoad
+	}
+	if load != expectedLoad {
+		t.Logf("Load calculation: overall=%f, countLoad=%f, byteLoad=%f", load, countLoad, byteLoad)
+	}
+}
+
+func TestScalerLoadCalculationMethods(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	cfg := DefaultPoolConfig()
+	cfg.MinWorkers = 1
+	cfg.MaxWorkers = 4
+	cfg.Worker.BatchSize = 100
+	cfg.Worker.MaxPendingBytes = 1000
+	pool := NewPool(cfg, 0, batchStore, txIndex, 3)
+	_ = pool.Start()
+	defer func() { _ = pool.Stop() }()
+
+	scaler := NewScaler(pool, DefaultScalerConfig())
+
+	// Initially both loads should be 0
+	if scaler.CalculateCountLoad() != 0 {
+		t.Error("Expected count load 0 initially")
+	}
+	if scaler.CalculateByteLoad() != 0 {
+		t.Error("Expected byte load 0 initially")
+	}
+
+	// Add some transactions
+	for i := 0; i < 50; i++ {
+		tx := types.Transaction([]byte{byte(i)})
+		_ = pool.AddTx(tx)
+	}
+
+	// Count load should be 50/100 = 0.5
+	countLoad := scaler.CalculateCountLoad()
+	if countLoad < 0.45 || countLoad > 0.55 {
+		t.Errorf("Expected count load ~0.5, got %f", countLoad)
+	}
+
+	// Byte load should be 50/(1000) = 0.05
+	byteLoad := scaler.CalculateByteLoad()
+	if byteLoad < 0.04 || byteLoad > 0.06 {
+		t.Errorf("Expected byte load ~0.05, got %f", byteLoad)
+	}
+
+	// Overall load should be the maximum (count load in this case)
+	load := scaler.CalculateLoad()
+	if load < 0.45 || load > 0.55 {
+		t.Errorf("Expected load ~0.5, got %f", load)
+	}
+}

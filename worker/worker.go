@@ -12,7 +12,11 @@ import (
 // Config contains worker configuration.
 type Config struct {
 	// BatchSize is the maximum number of transactions per batch.
+	// When pending transactions reach this count, a batch is created immediately.
 	BatchSize int
+	// BatchBytes is the maximum size in bytes for a batch.
+	// When pending bytes reach this limit, a batch is created immediately.
+	BatchBytes int64
 	// BatchTimeout is the maximum time to wait before creating a batch.
 	BatchTimeout time.Duration
 	// MaxPendingTxs is the maximum number of pending transactions.
@@ -27,6 +31,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		BatchSize:       1000,
+		BatchBytes:      512 * 1024, // 512KB max batch size
 		BatchTimeout:    100 * time.Millisecond,
 		MaxPendingTxs:   10000,
 		MaxPendingBytes: 50 * 1024 * 1024, // 50MB
@@ -67,9 +72,10 @@ type Worker struct {
 	batchCallback BatchCallback
 
 	// Lifecycle
-	running  atomic.Bool
-	stopCh   chan struct{}
+	running   atomic.Bool
+	stopCh    chan struct{}
 	stoppedCh chan struct{}
+	triggerCh chan struct{} // Triggers immediate batch creation when size/bytes limits reached
 }
 
 // New creates a new Worker.
@@ -91,6 +97,7 @@ func New(
 		ackTracker:  NewAckTracker(quorum, cfg.AckTimeout),
 		stopCh:      make(chan struct{}),
 		stoppedCh:   make(chan struct{}),
+		triggerCh:   make(chan struct{}, 1), // Buffered to prevent blocking
 	}
 }
 
@@ -113,6 +120,7 @@ func (w *Worker) Start() error {
 	// Reset channels for restart capability
 	w.stopCh = make(chan struct{})
 	w.stoppedCh = make(chan struct{})
+	w.triggerCh = make(chan struct{}, 1)
 
 	go w.batchLoop()
 	return nil
@@ -182,25 +190,28 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 	}
 
 	w.pendingMu.Lock()
-	defer w.pendingMu.Unlock()
 
 	txHash := tx.Hash()
 
 	// Check for duplicates in pending
 	if w.pendingSet[txHash] {
+		w.pendingMu.Unlock()
 		return nil // Idempotent - already have it
 	}
 
 	// Check if already indexed (in a previous batch)
 	if w.txIndex != nil && w.txIndex.HasTx(txHash) {
+		w.pendingMu.Unlock()
 		return nil // Already batched
 	}
 
 	// Check backpressure
 	if len(w.pending) >= w.cfg.MaxPendingTxs {
+		w.pendingMu.Unlock()
 		return types.ErrWorkerBackpressure
 	}
 	if w.pendingBytes+int64(tx.Size()) > w.cfg.MaxPendingBytes {
+		w.pendingMu.Unlock()
 		return types.ErrWorkerBackpressure
 	}
 
@@ -208,6 +219,22 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 	w.pending = append(w.pending, tx.Clone())
 	w.pendingSet[txHash] = true
 	w.pendingBytes += int64(tx.Size())
+
+	// Check if we should trigger immediate batch creation
+	shouldTrigger := len(w.pending) >= w.cfg.BatchSize ||
+		(w.cfg.BatchBytes > 0 && w.pendingBytes >= w.cfg.BatchBytes)
+
+	w.pendingMu.Unlock()
+
+	// Trigger batch creation if size or byte limits reached
+	if shouldTrigger {
+		select {
+		case w.triggerCh <- struct{}{}:
+			// Signal sent
+		default:
+			// Channel already has a signal, skip
+		}
+	}
 
 	return nil
 }
@@ -217,6 +244,30 @@ func (w *Worker) PendingCount() int {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
 	return len(w.pending)
+}
+
+// DrainPending removes and returns all pending transactions.
+// Used during worker scale-down to prevent transaction loss.
+func (w *Worker) DrainPending() []types.Transaction {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+
+	if len(w.pending) == 0 {
+		return nil
+	}
+
+	// Clone the transactions to return
+	txs := make([]types.Transaction, len(w.pending))
+	for i, tx := range w.pending {
+		txs[i] = tx.Clone()
+	}
+
+	// Clear pending state
+	w.pending = make([]types.Transaction, 0, w.cfg.BatchSize)
+	w.pendingSet = make(map[types.Hash]bool)
+	w.pendingBytes = 0
+
+	return txs
 }
 
 // PendingBytes returns the total size of pending transactions.
@@ -270,6 +321,9 @@ func (w *Worker) batchLoop() {
 		select {
 		case <-ticker.C:
 			w.tryCreateBatch()
+		case <-w.triggerCh:
+			// Immediate batch creation triggered by size/byte limit
+			w.tryCreateBatch()
 		case <-w.stopCh:
 			// Create final batch if there are pending transactions
 			w.tryCreateBatch()
@@ -279,6 +333,7 @@ func (w *Worker) batchLoop() {
 }
 
 // tryCreateBatch creates a batch if there are enough pending transactions.
+// On storage failure, transactions are requeued to prevent data loss.
 func (w *Worker) tryCreateBatch() {
 	w.pendingMu.Lock()
 
@@ -287,8 +342,21 @@ func (w *Worker) tryCreateBatch() {
 		return
 	}
 
-	// Take up to BatchSize transactions
+	// Take up to BatchSize transactions, also respecting BatchBytes limit
 	count := min(len(w.pending), w.cfg.BatchSize)
+
+	// If BatchBytes is configured, limit batch size by bytes
+	if w.cfg.BatchBytes > 0 {
+		var batchBytes int64
+		for i := 0; i < count; i++ {
+			txBytes := int64(w.pending[i].Size())
+			if batchBytes+txBytes > w.cfg.BatchBytes && i > 0 {
+				count = i
+				break
+			}
+			batchBytes += txBytes
+		}
+	}
 
 	txs := make([]types.Transaction, count)
 	copy(txs, w.pending[:count])
@@ -314,7 +382,8 @@ func (w *Worker) tryCreateBatch() {
 	// Store batch
 	if w.batchStore != nil {
 		if err := w.batchStore.SaveBatch(batch); err != nil {
-			// Log error but continue
+			// Storage failure - requeue transactions to prevent data loss
+			w.requeueTransactions(txs)
 			return
 		}
 	}
@@ -330,5 +399,29 @@ func (w *Worker) tryCreateBatch() {
 	// Notify callback
 	if w.batchCallback != nil {
 		w.batchCallback(batch)
+	}
+}
+
+// requeueTransactions adds transactions back to the pending pool after a storage failure.
+// This prevents transaction loss when storage operations fail.
+func (w *Worker) requeueTransactions(txs []types.Transaction) {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+
+	for _, tx := range txs {
+		txHash := tx.Hash()
+		// Only add if not already pending (could happen with concurrent operations)
+		if !w.pendingSet[txHash] {
+			// Check backpressure - if at limit, we have to drop transactions
+			if len(w.pending) >= w.cfg.MaxPendingTxs {
+				break
+			}
+			if w.pendingBytes+int64(tx.Size()) > w.cfg.MaxPendingBytes {
+				break
+			}
+			w.pending = append(w.pending, tx)
+			w.pendingSet[txHash] = true
+			w.pendingBytes += int64(tx.Size())
+		}
 	}
 }

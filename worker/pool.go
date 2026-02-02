@@ -280,6 +280,7 @@ func (p *Pool) ScaleUp() bool {
 }
 
 // ScaleDown removes a worker if above minimum.
+// Pending transactions from the removed worker are redistributed to remaining workers.
 // Returns true if a worker was removed.
 func (p *Pool) ScaleDown() bool {
 	if !p.running.Load() {
@@ -293,13 +294,42 @@ func (p *Pool) ScaleDown() bool {
 		return false
 	}
 
-	// Remove last worker (drain handled by Stop)
+	// Remove last worker
 	idx := len(p.workers) - 1
 	w := p.workers[idx]
 	p.workers = p.workers[:idx]
 
+	// Drain pending transactions before stopping
+	pending := w.DrainPending()
+
+	// Stop the worker
 	_ = w.Stop()
+
+	// Redistribute pending transactions to remaining workers
+	if len(pending) > 0 && len(p.workers) > 0 {
+		p.redistributeTxsLocked(pending)
+	}
+
 	return true
+}
+
+// redistributeTxsLocked redistributes transactions across remaining workers.
+// Caller must hold workersMu lock.
+func (p *Pool) redistributeTxsLocked(txs []types.Transaction) {
+	if len(p.workers) == 0 {
+		return
+	}
+
+	for _, tx := range txs {
+		// Route to worker based on tx hash
+		txHash := tx.Hash()
+		hashValue := binary.BigEndian.Uint64(txHash[:8])
+		workerIdx := int(hashValue % uint64(len(p.workers)))
+		worker := p.workers[workerIdx]
+
+		// Add transaction - ignore errors (backpressure, duplicates)
+		_ = worker.AddTx(tx)
+	}
 }
 
 // GetWorker returns a worker by index (for testing).

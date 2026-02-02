@@ -2,6 +2,8 @@ package looseberry
 
 import (
 	"fmt"
+	"log"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -831,6 +833,8 @@ func (l *Looseberry) handleSyncResponse(msg *network.SyncResponseMessage) {
 
 // onBatchCreated is called when a batch is created by a worker.
 func (l *Looseberry) onBatchCreated(batch *types.Batch) {
+	defer recoverCallback("onBatchCreated")
+
 	l.totalBatches.Add(1)
 
 	l.mu.RLock()
@@ -853,6 +857,8 @@ func (l *Looseberry) onBatchCreated(batch *types.Batch) {
 
 // onHeaderCreated is called when a header is created by the primary.
 func (l *Looseberry) onHeaderCreated(header *types.Header) {
+	defer recoverCallback("onHeaderCreated")
+
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -864,6 +870,8 @@ func (l *Looseberry) onHeaderCreated(header *types.Header) {
 
 // onVoteCreated is called when a vote is created for a header.
 func (l *Looseberry) onVoteCreated(vote *types.Vote, targetValidator uint16) {
+	defer recoverCallback("onVoteCreated")
+
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -875,6 +883,8 @@ func (l *Looseberry) onVoteCreated(vote *types.Vote, targetValidator uint16) {
 
 // onCertificateFormed is called when a certificate is formed.
 func (l *Looseberry) onCertificateFormed(cert *types.Certificate) {
+	defer recoverCallback("onCertificateFormed")
+
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -896,6 +906,8 @@ func (l *Looseberry) onCertificateFormed(cert *types.Certificate) {
 
 // onTxRecovered is called when transactions are recovered during GC.
 func (l *Looseberry) onTxRecovered(txs []types.Transaction) {
+	defer recoverCallback("onTxRecovered")
+
 	// Re-add recovered transactions to the pool
 	for _, tx := range txs {
 		// Don't validate recovered transactions - they were already validated
@@ -907,3 +919,12 @@ func (l *Looseberry) onTxRecovered(txs []types.Transaction) {
 
 // Verify interface compliance
 var _ DAGMempool = (*Looseberry)(nil)
+
+// recoverCallback recovers from panics in callback functions.
+// It logs the panic and stack trace, allowing the system to continue operating.
+func recoverCallback(callbackName string) {
+	if r := recover(); r != nil {
+		log.Printf("ERROR: Panic in %s callback: %v\nStack trace:\n%s",
+			callbackName, r, string(debug.Stack()))
+	}
+}

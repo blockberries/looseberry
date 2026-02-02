@@ -537,3 +537,172 @@ func TestDAGNoStore(t *testing.T) {
 		t.Error("Should not find non-existent certificate")
 	}
 }
+
+// Test for Bug Fix #7: DAG Parent Validation
+func TestDAGParentValidation(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	defer certStore.Close()
+
+	dag := New(certStore, DefaultConfig())
+
+	// Create round 0 certificate (no parents required)
+	cert0 := createTestCertificate(t, 0, 0, nil)
+	err := dag.AddCertificate(cert0)
+	if err != nil {
+		t.Fatalf("AddCertificate for round 0 failed: %v", err)
+	}
+
+	// Create round 1 certificate with valid parent
+	parentRef := types.CertificateRef{
+		Digest: cert0.Digest(),
+		Round:  0,
+	}
+	cert1 := createTestCertificate(t, 0, 1, []types.CertificateRef{parentRef})
+	err = dag.AddCertificate(cert1)
+	if err != nil {
+		t.Fatalf("AddCertificate with valid parent failed: %v", err)
+	}
+
+	// Create certificate with missing parent
+	missingParentRef := types.CertificateRef{
+		Digest: types.HashBytes([]byte("nonexistent")),
+		Round:  0,
+	}
+	certWithMissingParent := createTestCertificate(t, 1, 2, []types.CertificateRef{missingParentRef})
+	err = dag.AddCertificate(certWithMissingParent)
+	if err != types.ErrMissingParents {
+		t.Errorf("Expected ErrMissingParents for certificate with missing parent, got: %v", err)
+	}
+}
+
+func TestDAGRound0NoParentValidation(t *testing.T) {
+	dag := New(nil, DefaultConfig())
+
+	// Round 0 certificate should not require parents
+	cert := createTestCertificate(t, 0, 0, nil)
+	err := dag.AddCertificate(cert)
+	if err != nil {
+		t.Errorf("Round 0 certificate should not require parents, got: %v", err)
+	}
+}
+
+func TestDAGParentValidationWithStore(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	defer certStore.Close()
+
+	dag := New(certStore, DefaultConfig())
+
+	// Add certificate to store directly (simulating already-persisted cert)
+	cert0 := createTestCertificate(t, 0, 0, nil)
+	_ = certStore.SaveCertificate(cert0)
+
+	// Create certificate referencing parent in store (not in memory)
+	parentRef := types.CertificateRef{
+		Digest: cert0.Digest(),
+		Round:  0,
+	}
+	cert1 := createTestCertificate(t, 0, 1, []types.CertificateRef{parentRef})
+
+	// This should succeed because parent is in store
+	err := dag.AddCertificate(cert1)
+	if err != nil {
+		t.Errorf("AddCertificate should find parent in store, got: %v", err)
+	}
+}
+
+// Test smarter cache invalidation (Performance Optimization #6)
+func TestDAGSmartCacheInvalidation(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	defer certStore.Close()
+
+	dag := New(certStore, DefaultConfig())
+
+	// Add certificates for rounds 0-4
+	certs := make([]*types.Certificate, 5)
+	for round := uint64(0); round < 5; round++ {
+		certs[round] = createTestCertificate(t, 0, round, nil)
+		_ = dag.AddCertificate(certs[round])
+	}
+
+	// Get causal history for cert at round 4 (populates cache)
+	history := dag.CausalHistory(certs[4])
+	if len(history) == 0 {
+		t.Fatal("Expected non-empty causal history")
+	}
+
+	// Get causal history for cert at round 2 (populates cache)
+	history2 := dag.CausalHistory(certs[2])
+	if len(history2) == 0 {
+		t.Fatal("Expected non-empty causal history for round 2")
+	}
+
+	// Verify both are cached
+	dag.historyCacheMu.RLock()
+	cacheSize := len(dag.historyCache)
+	hasCert4Cache := dag.historyCache[certs[4].Digest()] != nil
+	hasCert2Cache := dag.historyCache[certs[2].Digest()] != nil
+	dag.historyCacheMu.RUnlock()
+
+	if cacheSize != 2 {
+		t.Errorf("Expected 2 cached entries, got %d", cacheSize)
+	}
+	if !hasCert4Cache {
+		t.Error("Round 4 cert history should be cached")
+	}
+	if !hasCert2Cache {
+		t.Error("Round 2 cert history should be cached")
+	}
+
+	// Add a new certificate at round 3 (between existing certs)
+	// This should only invalidate cache for certs at higher rounds (round 4)
+	// but preserve cache for lower/equal rounds (round 2)
+	newCert := createTestCertificate(t, 1, 3, nil)
+	_ = dag.AddCertificate(newCert)
+
+	dag.historyCacheMu.RLock()
+	hasCert4CacheAfter := dag.historyCache[certs[4].Digest()] != nil
+	hasCert2CacheAfter := dag.historyCache[certs[2].Digest()] != nil
+	dag.historyCacheMu.RUnlock()
+
+	// Round 4 cache should be invalidated (higher round than new cert)
+	if hasCert4CacheAfter {
+		t.Error("Round 4 cert cache should be invalidated after adding round 3 cert")
+	}
+
+	// Round 2 cache should be preserved (lower round than new cert)
+	if !hasCert2CacheAfter {
+		t.Error("Round 2 cert cache should be preserved after adding round 3 cert")
+	}
+}
+
+func TestDAGSmartCacheInvalidationRound0(t *testing.T) {
+	dag := New(nil, DefaultConfig())
+
+	// Add certificate at round 0
+	cert0 := createTestCertificate(t, 0, 0, nil)
+	_ = dag.AddCertificate(cert0)
+
+	// Get history (populates cache)
+	_ = dag.CausalHistory(cert0)
+
+	dag.historyCacheMu.RLock()
+	hasCacheBefore := dag.historyCache[cert0.Digest()] != nil
+	dag.historyCacheMu.RUnlock()
+
+	if !hasCacheBefore {
+		t.Error("Round 0 cert history should be cached")
+	}
+
+	// Add another round 0 cert (from different validator)
+	cert0b := createTestCertificate(t, 1, 0, nil)
+	_ = dag.AddCertificate(cert0b)
+
+	// Round 0 cache should be preserved (same round as new cert, not affected)
+	dag.historyCacheMu.RLock()
+	hasCacheAfter := dag.historyCache[cert0.Digest()] != nil
+	dag.historyCacheMu.RUnlock()
+
+	if !hasCacheAfter {
+		t.Error("Round 0 cert cache should be preserved when adding another round 0 cert")
+	}
+}

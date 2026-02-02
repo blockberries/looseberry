@@ -20,15 +20,24 @@ type SyncConfig struct {
 	SyncBatchSize int
 	// SyncTimeout is the timeout for sync requests.
 	SyncTimeout time.Duration
+	// MaxRetries is the maximum number of retry attempts for failed sync requests.
+	MaxRetries int
+	// InitialBackoff is the initial backoff duration for retries.
+	InitialBackoff time.Duration
+	// MaxBackoff is the maximum backoff duration for retries.
+	MaxBackoff time.Duration
 }
 
 // DefaultSyncConfig returns default sync configuration.
 func DefaultSyncConfig() SyncConfig {
 	return SyncConfig{
-		SyncInterval:  10 * time.Second,
-		SyncThreshold: 5,
-		SyncBatchSize: 100,
-		SyncTimeout:   30 * time.Second,
+		SyncInterval:   10 * time.Second,
+		SyncThreshold:  5,
+		SyncBatchSize:  100,
+		SyncTimeout:    30 * time.Second,
+		MaxRetries:     5,
+		InitialBackoff: 1 * time.Second,
+		MaxBackoff:     30 * time.Second,
 	}
 }
 
@@ -56,9 +65,13 @@ type SyncManager struct {
 }
 
 type pendingSyncRequest struct {
-	fromRound uint64
-	toRound   uint64
-	sentAt    time.Time
+	fromRound    uint64
+	toRound      uint64
+	sentAt       time.Time
+	retryCount   int
+	lastRetryAt  time.Time
+	nextRetryAt  time.Time
+	targetPeer   uint16
 }
 
 // NewSyncManager creates a new sync manager.
@@ -132,11 +145,16 @@ func (s *SyncManager) RequestSync(validator uint16, fromRound, toRound uint64) e
 		Requester: s.network.ValidatorID(),
 	}
 
+	now := time.Now()
 	s.pendingReqsMu.Lock()
 	s.pendingReqs[validator] = &pendingSyncRequest{
-		fromRound: fromRound,
-		toRound:   toRound,
-		sentAt:    time.Now(),
+		fromRound:   fromRound,
+		toRound:     toRound,
+		sentAt:      now,
+		retryCount:  0,
+		lastRetryAt: now,
+		nextRetryAt: now.Add(s.cfg.InitialBackoff),
+		targetPeer:  validator,
 	}
 	s.pendingReqsMu.Unlock()
 
@@ -297,17 +315,108 @@ func (s *SyncManager) checkAndSync() {
 	// For now, just a placeholder
 }
 
-// cleanupTimedOutRequests removes timed out pending requests.
+// cleanupTimedOutRequests handles timed out pending requests with retry logic.
 func (s *SyncManager) cleanupTimedOutRequests() {
+	now := time.Now()
+
+	s.pendingReqsMu.Lock()
+	var toRetry []*pendingSyncRequest
+	var toRemove []uint16
+
+	for validator, req := range s.pendingReqs {
+		// Check if request has timed out
+		if now.After(req.nextRetryAt) {
+			if req.retryCount >= s.cfg.MaxRetries {
+				// Max retries reached, remove the request
+				toRemove = append(toRemove, validator)
+			} else {
+				// Schedule retry with exponential backoff
+				toRetry = append(toRetry, req)
+			}
+		}
+	}
+
+	// Remove failed requests
+	for _, validator := range toRemove {
+		delete(s.pendingReqs, validator)
+	}
+
+	// Update retry counts and schedule for retrying requests
+	for _, req := range toRetry {
+		req.retryCount++
+		req.lastRetryAt = now
+
+		// Calculate exponential backoff: initialBackoff * 2^retryCount, capped at maxBackoff
+		backoff := s.cfg.InitialBackoff
+		for i := 0; i < req.retryCount && backoff < s.cfg.MaxBackoff; i++ {
+			backoff *= 2
+			if backoff > s.cfg.MaxBackoff {
+				backoff = s.cfg.MaxBackoff
+			}
+		}
+		req.nextRetryAt = now.Add(backoff)
+	}
+
+	s.pendingReqsMu.Unlock()
+
+	// Retry requests outside the lock
+	for _, req := range toRetry {
+		s.retrySyncRequest(req)
+	}
+}
+
+// retrySyncRequest retries a sync request, potentially to a different peer.
+func (s *SyncManager) retrySyncRequest(req *pendingSyncRequest) {
+	if !s.running.Load() {
+		return
+	}
+
+	// Try to find a different peer
+	s.validatorMu.RLock()
+	validators := s.validatorSet.Validators()
+	s.validatorMu.RUnlock()
+
+	myID := s.network.ValidatorID()
+	targetPeer := req.targetPeer
+
+	// Try a different peer on each retry (round-robin through validators)
+	if len(validators) > 1 {
+		for _, v := range validators {
+			if v.Index != myID && v.Index != req.targetPeer {
+				targetPeer = v.Index
+				break
+			}
+		}
+	}
+
+	// Update target peer in the request
+	s.pendingReqsMu.Lock()
+	if existing, ok := s.pendingReqs[req.targetPeer]; ok && existing == req {
+		// Move to new peer
+		delete(s.pendingReqs, req.targetPeer)
+		req.targetPeer = targetPeer
+		s.pendingReqs[targetPeer] = req
+	}
+	s.pendingReqsMu.Unlock()
+
+	// Send retry request
+	syncReq := &SyncRequest{
+		FromRound: req.fromRound,
+		ToRound:   req.toRound,
+		Requester: s.network.ValidatorID(),
+	}
+	_ = s.network.SendSyncRequest(targetPeer, syncReq)
+}
+
+// GetRetryCount returns the retry count for a pending request to a validator.
+func (s *SyncManager) GetRetryCount(validator uint16) int {
 	s.pendingReqsMu.Lock()
 	defer s.pendingReqsMu.Unlock()
 
-	cutoff := time.Now().Add(-s.cfg.SyncTimeout)
-	for validator, req := range s.pendingReqs {
-		if req.sentAt.Before(cutoff) {
-			delete(s.pendingReqs, validator)
-		}
+	if req, ok := s.pendingReqs[validator]; ok {
+		return req.retryCount
 	}
+	return -1 // Not found
 }
 
 // handleMessages handles incoming sync messages.

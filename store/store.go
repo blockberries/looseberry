@@ -69,6 +69,10 @@ type TxIndex interface {
 	// RemoveTxsForBatch removes all transaction mappings for a batch.
 	RemoveTxsForBatch(batchHash types.Hash) error
 
+	// PruneOlderThan removes all transaction mappings for batches older than the given round.
+	// Returns the number of batches pruned and any error encountered.
+	PruneOlderThan(round uint64, batchStore BatchStore) (int, error)
+
 	// Close closes the index.
 	Close() error
 }

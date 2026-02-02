@@ -33,6 +33,11 @@ func (s Signature) IsEmpty() bool {
 	return s == EmptySignature
 }
 
+// Equal returns true if two signatures are equal.
+func (s Signature) Equal(other Signature) bool {
+	return s == other
+}
+
 // SignatureFromBytes creates a Signature from a byte slice.
 func SignatureFromBytes(b []byte) (Signature, error) {
 	if len(b) != SignatureSize {

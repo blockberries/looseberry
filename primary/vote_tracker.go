@@ -7,6 +7,15 @@ import (
 	"github.com/blockberries/looseberry/types"
 )
 
+// DoubleVoteEvidence records evidence of a validator sending conflicting votes.
+type DoubleVoteEvidence struct {
+	ValidatorID uint16
+	HeaderID    types.Hash
+	Vote1       *types.Vote
+	Vote2       *types.Vote
+	Timestamp   time.Time
+}
+
 // PendingHeader tracks a header waiting for votes.
 type PendingHeader struct {
 	Header    *types.Header
@@ -21,13 +30,20 @@ type VoteTracker struct {
 	mu      sync.RWMutex
 	timeout time.Duration
 	closed  bool
+
+	// Double vote detection: tracks all votes per validator across all headers
+	// Key: validatorID, Value: map of headerDigest -> vote
+	validatorVotes map[uint16]map[types.Hash]*types.Vote
+	doubleVotes    []DoubleVoteEvidence
 }
 
 // NewVoteTracker creates a new vote tracker.
 func NewVoteTracker(timeout time.Duration) *VoteTracker {
 	return &VoteTracker{
-		pending: make(map[types.Hash]*PendingHeader),
-		timeout: timeout,
+		pending:        make(map[types.Hash]*PendingHeader),
+		timeout:        timeout,
+		validatorVotes: make(map[uint16]map[types.Hash]*types.Vote),
+		doubleVotes:    make([]DoubleVoteEvidence, 0),
 	}
 }
 
@@ -77,6 +93,7 @@ func (vt *VoteTracker) GetHeader(digest types.Hash) (*types.Header, bool) {
 // RecordVote records a vote for a header.
 // Returns (certificate, true) if quorum is reached with this vote.
 // Returns (nil, false) if header not tracked or quorum not reached.
+// Detects and records double voting (same validator voting for conflicting headers).
 func (vt *VoteTracker) RecordVote(vote *types.Vote, quorum int) (*types.Certificate, bool) {
 	vt.mu.Lock()
 	defer vt.mu.Unlock()
@@ -90,7 +107,33 @@ func (vt *VoteTracker) RecordVote(vote *types.Vote, quorum int) (*types.Certific
 		return nil, false
 	}
 
-	// Don't double-count
+	// Check for double voting (Byzantine behavior)
+	if existingVotes, hasValidator := vt.validatorVotes[vote.Validator]; hasValidator {
+		if existingVote, hasHeader := existingVotes[vote.HeaderDigest]; hasHeader {
+			// Vote for same header already exists
+			// Check if it's a conflicting vote (different signature could mean different content)
+			if !existingVote.Signature.Equal(vote.Signature) {
+				// Record double vote evidence
+				vt.doubleVotes = append(vt.doubleVotes, DoubleVoteEvidence{
+					ValidatorID: vote.Validator,
+					HeaderID:    vote.HeaderDigest,
+					Vote1:       existingVote.Clone(),
+					Vote2:       vote.Clone(),
+					Timestamp:   time.Now(),
+				})
+			}
+			// Already have vote from this validator for this header
+			if len(pending.Votes) >= quorum {
+				return vt.formCertificateLocked(pending, quorum), true
+			}
+			return nil, false
+		}
+	} else {
+		// Initialize validator's vote map
+		vt.validatorVotes[vote.Validator] = make(map[types.Hash]*types.Vote)
+	}
+
+	// Don't double-count in pending
 	if _, hasVote := pending.Votes[vote.Validator]; hasVote {
 		// Already have vote, check if we have quorum
 		if len(pending.Votes) >= quorum {
@@ -100,7 +143,9 @@ func (vt *VoteTracker) RecordVote(vote *types.Vote, quorum int) (*types.Certific
 	}
 
 	// Add vote
-	pending.Votes[vote.Validator] = vote.Clone()
+	clonedVote := vote.Clone()
+	pending.Votes[vote.Validator] = clonedVote
+	vt.validatorVotes[vote.Validator][vote.HeaderDigest] = clonedVote
 
 	// Check quorum
 	if len(pending.Votes) >= quorum {
@@ -127,6 +172,15 @@ func (vt *VoteTracker) VoteCount(digest types.Hash) int {
 func (vt *VoteTracker) RemoveHeader(digest types.Hash) {
 	vt.mu.Lock()
 	defer vt.mu.Unlock()
+
+	// Clean up validator votes for this header
+	for validatorID, votes := range vt.validatorVotes {
+		delete(votes, digest)
+		// If validator has no more votes, remove the entry
+		if len(votes) == 0 {
+			delete(vt.validatorVotes, validatorID)
+		}
+	}
 
 	delete(vt.pending, digest)
 }
@@ -181,6 +235,41 @@ func (vt *VoteTracker) Close() {
 
 	vt.closed = true
 	vt.pending = nil
+	vt.validatorVotes = nil
+	vt.doubleVotes = nil
+}
+
+// GetDoubleVoteEvidence returns all recorded double vote evidence.
+// This evidence can be used for slashing Byzantine validators.
+func (vt *VoteTracker) GetDoubleVoteEvidence() []DoubleVoteEvidence {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	if len(vt.doubleVotes) == 0 {
+		return nil
+	}
+
+	// Return a copy to prevent external modification
+	evidence := make([]DoubleVoteEvidence, len(vt.doubleVotes))
+	copy(evidence, vt.doubleVotes)
+	return evidence
+}
+
+// ClearDoubleVoteEvidence clears all recorded double vote evidence.
+// Call this after evidence has been processed (e.g., submitted for slashing).
+func (vt *VoteTracker) ClearDoubleVoteEvidence() {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+
+	vt.doubleVotes = make([]DoubleVoteEvidence, 0)
+}
+
+// HasDoubleVoteEvidence returns true if there is any double vote evidence.
+func (vt *VoteTracker) HasDoubleVoteEvidence() bool {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	return len(vt.doubleVotes) > 0
 }
 
 // formCertificateLocked forms a certificate from the pending header.

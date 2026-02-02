@@ -17,6 +17,7 @@ type MockNetwork struct {
 	batchCh        chan *BatchMessage
 	batchAckCh     chan *BatchAckMessage
 	batchReqCh     chan *BatchRequestMessage
+	batchRespCh    chan *BatchResponseMessage
 	headerCh       chan *HeaderMessage
 	voteCh         chan *VoteMessage
 	certCh         chan *CertificateMessage
@@ -43,6 +44,8 @@ type MockNetworkStats struct {
 	CertificatesBroadcast int
 	VotesSent             int
 	BatchAcksSent         int
+	BatchRequestsSent     int
+	BatchResponsesSent    int
 	SyncRequestsSent      int
 	SyncResponsesSent     int
 }
@@ -55,6 +58,7 @@ func NewMockNetwork(validatorID uint16, cfg Config) *MockNetwork {
 		batchCh:        make(chan *BatchMessage, cfg.BufferSize),
 		batchAckCh:     make(chan *BatchAckMessage, cfg.BufferSize),
 		batchReqCh:     make(chan *BatchRequestMessage, cfg.BufferSize),
+		batchRespCh:    make(chan *BatchResponseMessage, cfg.BufferSize),
 		headerCh:       make(chan *HeaderMessage, cfg.BufferSize),
 		voteCh:         make(chan *VoteMessage, cfg.BufferSize),
 		certCh:         make(chan *CertificateMessage, cfg.BufferSize),
@@ -258,6 +262,10 @@ func (m *MockNetwork) SendBatchRequest(validator uint16, req *BatchRequestMessag
 		return types.ErrNotRunning
 	}
 
+	m.statsMu.Lock()
+	m.stats.BatchRequestsSent++
+	m.statsMu.Unlock()
+
 	m.peersMu.RLock()
 	peer, ok := m.peers[validator]
 	m.peersMu.RUnlock()
@@ -268,6 +276,32 @@ func (m *MockNetwork) SendBatchRequest(validator uint16, req *BatchRequestMessag
 
 	select {
 	case peer.batchReqCh <- req:
+		return nil
+	default:
+		return types.ErrMempoolFull
+	}
+}
+
+// SendBatchResponse sends a batch response to a specific validator.
+func (m *MockNetwork) SendBatchResponse(validator uint16, resp *BatchResponseMessage) error {
+	if !m.running.Load() {
+		return types.ErrNotRunning
+	}
+
+	m.statsMu.Lock()
+	m.stats.BatchResponsesSent++
+	m.statsMu.Unlock()
+
+	m.peersMu.RLock()
+	peer, ok := m.peers[validator]
+	m.peersMu.RUnlock()
+
+	if !ok {
+		return types.ErrValidatorNotFound
+	}
+
+	select {
+	case peer.batchRespCh <- resp:
 		return nil
 	default:
 		return types.ErrMempoolFull
@@ -344,6 +378,11 @@ func (m *MockNetwork) BatchAckMessages() <-chan *BatchAckMessage {
 // BatchRequestMessages returns the channel for incoming batch request messages.
 func (m *MockNetwork) BatchRequestMessages() <-chan *BatchRequestMessage {
 	return m.batchReqCh
+}
+
+// BatchResponseMessages returns the channel for incoming batch response messages.
+func (m *MockNetwork) BatchResponseMessages() <-chan *BatchResponseMessage {
+	return m.batchRespCh
 }
 
 // HeaderMessages returns the channel for incoming header messages.

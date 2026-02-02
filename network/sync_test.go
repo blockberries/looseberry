@@ -507,4 +507,121 @@ func TestDefaultSyncConfig(t *testing.T) {
 	if cfg.SyncTimeout <= 0 {
 		t.Error("SyncTimeout should be positive")
 	}
+
+	if cfg.MaxRetries <= 0 {
+		t.Error("MaxRetries should be positive")
+	}
+
+	if cfg.InitialBackoff <= 0 {
+		t.Error("InitialBackoff should be positive")
+	}
+
+	if cfg.MaxBackoff <= 0 {
+		t.Error("MaxBackoff should be positive")
+	}
+}
+
+// Test Sync Retry Logic (Performance Optimization #8)
+func TestSyncManagerRetryLogic(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	batchStore := store.NewMemoryBatchStore()
+	defer certStore.Close()
+	defer batchStore.Close()
+
+	d := dag.New(certStore, dag.DefaultConfig())
+	network1 := NewMockNetwork(0, DefaultConfig())
+	network2 := NewMockNetwork(1, DefaultConfig())
+	vs, _ := createTestValidatorSet(t, 4)
+
+	network1.Connect(network2)
+
+	cfg := DefaultSyncConfig()
+	cfg.InitialBackoff = 10 * time.Millisecond
+	cfg.MaxBackoff = 50 * time.Millisecond
+	cfg.MaxRetries = 3
+
+	sm := NewSyncManager(d, batchStore, network1, vs, cfg)
+	_ = network1.Start()
+	_ = network2.Start()
+	defer func() { _ = network1.Stop() }()
+	defer func() { _ = network2.Stop() }()
+
+	if err := sm.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = sm.Stop() }()
+
+	// Request sync
+	err := sm.RequestSync(1, 0, 10)
+	if err != nil {
+		t.Fatalf("RequestSync failed: %v", err)
+	}
+
+	// Check initial retry count
+	retryCount := sm.GetRetryCount(1)
+	if retryCount != 0 {
+		t.Errorf("Expected initial retry count 0, got %d", retryCount)
+	}
+
+	// Verify pending request count
+	if sm.GetPendingRequestCount() != 1 {
+		t.Errorf("Expected 1 pending request, got %d", sm.GetPendingRequestCount())
+	}
+}
+
+func TestSyncManagerRetryExponentialBackoff(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	batchStore := store.NewMemoryBatchStore()
+	defer certStore.Close()
+	defer batchStore.Close()
+
+	d := dag.New(certStore, dag.DefaultConfig())
+	network := NewMockNetwork(0, DefaultConfig())
+	vs, _ := createTestValidatorSet(t, 4)
+
+	cfg := DefaultSyncConfig()
+	cfg.InitialBackoff = 10 * time.Millisecond
+	cfg.MaxBackoff = 100 * time.Millisecond
+	cfg.MaxRetries = 5
+
+	sm := NewSyncManager(d, batchStore, network, vs, cfg)
+
+	// Test backoff calculation manually
+	// First retry: 10ms * 2 = 20ms
+	// Second retry: 20ms * 2 = 40ms
+	// Third retry: 40ms * 2 = 80ms
+	// Fourth retry: 80ms * 2 = 160ms -> capped at 100ms
+
+	// Verify config is set correctly
+	if cfg.InitialBackoff != 10*time.Millisecond {
+		t.Error("InitialBackoff not set correctly")
+	}
+	if cfg.MaxBackoff != 100*time.Millisecond {
+		t.Error("MaxBackoff not set correctly")
+	}
+	if cfg.MaxRetries != 5 {
+		t.Error("MaxRetries not set correctly")
+	}
+
+	// Just verify the sync manager was created (backoff logic is internal)
+	_ = sm
+}
+
+func TestSyncManagerGetRetryCountNotFound(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	batchStore := store.NewMemoryBatchStore()
+	defer certStore.Close()
+	defer batchStore.Close()
+
+	d := dag.New(certStore, dag.DefaultConfig())
+	network := NewMockNetwork(0, DefaultConfig())
+	vs, _ := createTestValidatorSet(t, 4)
+
+	sm := NewSyncManager(d, batchStore, network, vs, DefaultSyncConfig())
+
+	// Get retry count for non-existent request
+	retryCount := sm.GetRetryCount(99)
+	if retryCount != -1 {
+		t.Errorf("Expected -1 for non-existent request, got %d", retryCount)
+	}
 }

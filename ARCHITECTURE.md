@@ -1463,3 +1463,17 @@ With 10 validators and parallel batching:
 | Worker scaling | Dynamic | Fixed | N/A |
 | Storage backend | Pluggable | RocksDB | Custom |
 | BFT assumption | n ≥ 3f+1 | n ≥ 3f+1 | n ≥ 3f+1 |
+
+---
+
+## Ecosystem References
+
+Looseberry is part of the Blockberries ecosystem. For complete integration documentation:
+
+- **[../ECOSYSTEM.md](../ECOSYSTEM.md)** - Complete ecosystem architecture and integration guide
+- **[../raspberry/ARCHITECTURE.md](../raspberry/ARCHITECTURE.md)** - Blockchain node integrating Looseberry
+- **[../blockberry/ARCHITECTURE.md](../blockberry/ARCHITECTURE.md)** - Node framework with DAGMempool interface
+- **[../leaderberry/ARCHITECTURE.md](../leaderberry/ARCHITECTURE.md)** - BFT consensus consuming Looseberry batches
+- **[../glueberry/ARCHITECTURE.md](../glueberry/ARCHITECTURE.md)** - Encrypted P2P networking for batch dissemination
+- **[../punnet-sdk/ARCHITECTURE.md](../punnet-sdk/ARCHITECTURE.md)** - Application module framework
+- **[../cramberry/ARCHITECTURE.md](../cramberry/ARCHITECTURE.md)** - Binary serialization

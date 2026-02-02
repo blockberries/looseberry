@@ -23,6 +23,13 @@ type BatchRequestMessage struct {
 	Requester   uint16
 }
 
+// BatchResponseMessage represents a response to a batch request.
+type BatchResponseMessage struct {
+	Batch *types.Batch
+	Found bool   // True if batch was found
+	From  uint16 // Validator who responded
+}
+
 // HeaderMessage represents a received header.
 type HeaderMessage struct {
 	Header *types.Header
@@ -86,6 +93,7 @@ type Network interface {
 	SendVote(validator uint16, vote *types.Vote) error
 	SendBatchAck(validator uint16, ack *BatchAckMessage) error
 	SendBatchRequest(validator uint16, req *BatchRequestMessage) error
+	SendBatchResponse(validator uint16, resp *BatchResponseMessage) error
 	SendSyncRequest(validator uint16, req *SyncRequest) error
 	SendSyncResponse(validator uint16, resp *SyncResponse) error
 
@@ -93,6 +101,7 @@ type Network interface {
 	BatchMessages() <-chan *BatchMessage
 	BatchAckMessages() <-chan *BatchAckMessage
 	BatchRequestMessages() <-chan *BatchRequestMessage
+	BatchResponseMessages() <-chan *BatchResponseMessage
 	HeaderMessages() <-chan *HeaderMessage
 	VoteMessages() <-chan *VoteMessage
 	CertificateMessages() <-chan *CertificateMessage

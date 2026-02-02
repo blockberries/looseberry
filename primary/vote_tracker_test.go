@@ -251,3 +251,100 @@ func TestVoteTrackerClose(t *testing.T) {
 		t.Error("Certificate should be nil after close")
 	}
 }
+
+// Test for Bug Fix #6: Double Voting Detection
+func TestVoteTrackerDoubleVoteDetection(t *testing.T) {
+	vt := NewVoteTracker(30 * time.Second)
+	defer vt.Close()
+
+	header := createTestHeader(t, 0, 10)
+	vt.TrackHeader(header)
+
+	// Create two different signers for the same validator (simulating double-sign)
+	signer1, _ := types.GenerateEd25519Signer(1)
+	signer2, _ := types.GenerateEd25519Signer(1) // Different key, same validator ID
+
+	// First vote from validator 1
+	vote1 := types.NewVote(header.Digest, 1)
+	_ = vote1.Sign(signer1)
+	vt.RecordVote(vote1, 3)
+
+	// Second vote from validator 1 with different signature (double voting!)
+	vote2 := types.NewVote(header.Digest, 1)
+	_ = vote2.Sign(signer2)
+	vt.RecordVote(vote2, 3)
+
+	// Should detect double vote
+	if !vt.HasDoubleVoteEvidence() {
+		t.Error("Should detect double vote evidence")
+	}
+
+	evidence := vt.GetDoubleVoteEvidence()
+	if len(evidence) != 1 {
+		t.Fatalf("Expected 1 double vote evidence, got %d", len(evidence))
+	}
+
+	if evidence[0].ValidatorID != 1 {
+		t.Errorf("Expected validator ID 1, got %d", evidence[0].ValidatorID)
+	}
+
+	if !evidence[0].HeaderID.Equal(header.Digest) {
+		t.Error("Evidence header ID mismatch")
+	}
+}
+
+func TestVoteTrackerNoDoubleVoteForIdenticalVotes(t *testing.T) {
+	vt := NewVoteTracker(30 * time.Second)
+	defer vt.Close()
+
+	header := createTestHeader(t, 0, 10)
+	vt.TrackHeader(header)
+
+	signer, _ := types.GenerateEd25519Signer(1)
+
+	// Same vote submitted twice (not double voting, just duplicate)
+	vote := types.NewVote(header.Digest, 1)
+	_ = vote.Sign(signer)
+
+	vt.RecordVote(vote, 3)
+	vt.RecordVote(vote, 3) // Exact same vote
+
+	// Should NOT detect double vote for identical votes
+	if vt.HasDoubleVoteEvidence() {
+		t.Error("Should not flag identical votes as double voting")
+	}
+}
+
+func TestVoteTrackerClearDoubleVoteEvidence(t *testing.T) {
+	vt := NewVoteTracker(30 * time.Second)
+	defer vt.Close()
+
+	header := createTestHeader(t, 0, 10)
+	vt.TrackHeader(header)
+
+	signer1, _ := types.GenerateEd25519Signer(1)
+	signer2, _ := types.GenerateEd25519Signer(1)
+
+	vote1 := types.NewVote(header.Digest, 1)
+	_ = vote1.Sign(signer1)
+	vt.RecordVote(vote1, 3)
+
+	vote2 := types.NewVote(header.Digest, 1)
+	_ = vote2.Sign(signer2)
+	vt.RecordVote(vote2, 3)
+
+	if !vt.HasDoubleVoteEvidence() {
+		t.Fatal("Should have double vote evidence")
+	}
+
+	vt.ClearDoubleVoteEvidence()
+
+	if vt.HasDoubleVoteEvidence() {
+		t.Error("Evidence should be cleared")
+	}
+
+	evidence := vt.GetDoubleVoteEvidence()
+	if len(evidence) != 0 {
+		t.Errorf("Expected 0 evidence after clear, got %d", len(evidence))
+	}
+}
