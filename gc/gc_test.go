@@ -229,6 +229,129 @@ func TestGCManagerTxRecovery(t *testing.T) {
 	}
 }
 
+// TestGCManagerTxRecovery_ClearsTxIndex is the regression test for
+// the burst-load tx loss reported as PLAN §E6
+// (TestPhaseE_MultiBlockTPS). When a batch is uncommitted at GC time,
+// its transactions are extracted and passed to the recovery callback.
+// The downstream callback re-adds the txs via workerPool.AddTx, but
+// Worker.AddTx short-circuits with nil if the tx hash is already
+// indexed ("Already batched" idempotency path). Before this fix
+// gc.extractUncommittedTxs did NOT clear the index entries first, so
+// every recovered tx hit the idempotency path and was silently
+// dropped. Net effect: 19% tx loss in the multi-block burst test.
+//
+// The fix: extractUncommittedTxs now calls txIndex.RemoveTxsForBatch
+// for each uncommitted batch before returning. This test pins that
+// behaviour — txIndex.HasTx must return false for the recovered tx
+// hashes once extraction has run.
+func TestGCManagerTxRecovery_ClearsTxIndex(t *testing.T) {
+	certStore := store.NewMemoryCertificateStore()
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer certStore.Close()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	d := dag.New(certStore, dag.DefaultConfig())
+
+	// Build one committed and one uncommitted batch with DISTINCT tx
+	// contents so the test can tell which txs come back.
+	committedTxs := []types.Transaction{
+		types.Transaction([]byte("committed-tx-1")),
+		types.Transaction([]byte("committed-tx-2")),
+	}
+	uncommittedTxs := []types.Transaction{
+		types.Transaction([]byte("uncommitted-tx-1")),
+		types.Transaction([]byte("uncommitted-tx-2")),
+	}
+	committedBatch := types.NewBatch(0, 0, 0, committedTxs)
+	uncommittedBatch := types.NewBatch(1, 0, 0, uncommittedTxs)
+	_ = batchStore.SaveBatch(committedBatch)
+	_ = batchStore.SaveBatch(uncommittedBatch)
+
+	// Index every tx — this mirrors what Worker.tryCreateBatch does
+	// when the worker hands a batch out.
+	if err := txIndex.AddBatch(committedBatch); err != nil {
+		t.Fatalf("txIndex.AddBatch(committed): %v", err)
+	}
+	if err := txIndex.AddBatch(uncommittedBatch); err != nil {
+		t.Fatalf("txIndex.AddBatch(uncommitted): %v", err)
+	}
+
+	// Sanity: every tx is in the index.
+	for _, tx := range uncommittedTxs {
+		if !txIndex.HasTx(tx.Hash()) {
+			t.Fatalf("setup broken: tx %q not indexed", string(tx))
+		}
+	}
+
+	// Only the committed batch has a certificate.
+	cert := createTestCertificate(t, 0, 0, []types.Hash{committedBatch.Digest})
+	_ = d.AddCertificate(cert)
+
+	cfg := DefaultConfig()
+	cfg.GCDepth = 0
+	cfg.RecoverUncommittedTxs = true
+	gcm := NewGCManager(d, batchStore, certStore, txIndex, cfg)
+
+	// Mirror what looseberry does in Start — register the uncommitted
+	// batch so the fast-path index has it.
+	gcm.TrackBatch(uncommittedBatch.Digest, 0)
+
+	// Capture state AT THE MOMENT the recovery callback fires. The bug
+	// is about ordering inside performGC: extractUncommittedTxs returns
+	// the txs, then the callback runs (which would re-add via
+	// workerPool.AddTx → Worker.AddTx → HasTx check). For the re-add
+	// path to succeed, the txIndex entries must already be gone by the
+	// time the callback fires. A later performGC step (PruneOlderThan)
+	// also clears the index, but that's too late — the callback's
+	// re-adds have already been silently dropped.
+	var recovered []types.Transaction
+	var hasTxAtCallback []bool
+	var mu sync.Mutex
+	gcm.SetTxRecoveryCallback(func(txs []types.Transaction) {
+		mu.Lock()
+		defer mu.Unlock()
+		recovered = append(recovered, txs...)
+		for _, tx := range txs {
+			hasTxAtCallback = append(hasTxAtCallback, txIndex.HasTx(tx.Hash()))
+		}
+	})
+
+	if err := gcm.NotifyCommitted(1); err != nil {
+		t.Fatalf("NotifyCommitted: %v", err)
+	}
+
+	// We should see the uncommitted batch's txs come back…
+	mu.Lock()
+	gotN := len(recovered)
+	hasSnap := append([]bool(nil), hasTxAtCallback...)
+	mu.Unlock()
+	if gotN != len(uncommittedTxs) {
+		t.Fatalf("recovered %d txs, want %d", gotN, len(uncommittedTxs))
+	}
+
+	// …AND at the recovery-callback moment, txIndex.HasTx must already
+	// return false for every recovered tx. Otherwise Worker.AddTx will
+	// short-circuit with nil ("Already batched") and the tx is lost.
+	for i, present := range hasSnap {
+		if present {
+			t.Fatalf("at recovery-callback time, txIndex still has recovered tx[%d] — "+
+				"Worker.AddTx will silently drop this tx via the HasTx idempotency "+
+				"path (PLAN §E6 burst-load tx loss)", i)
+		}
+	}
+
+	// The committed batch's txs shouldn't be observable in recovered.
+	for _, tx := range committedTxs {
+		for _, rt := range recovered {
+			if string(rt) == string(tx) {
+				t.Fatalf("committed tx %q unexpectedly returned via recovery", string(tx))
+			}
+		}
+	}
+}
+
 func TestGCManagerForceGC(t *testing.T) {
 	certStore := store.NewMemoryCertificateStore()
 	batchStore := store.NewMemoryBatchStore()

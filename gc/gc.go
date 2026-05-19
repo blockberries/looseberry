@@ -286,6 +286,17 @@ func (gc *GCManager) performGC(beforeRound uint64) error {
 // extractUncommittedTxs extracts transactions from batches that were not
 // included in committed certificates.
 // Uses the uncommitted batch index for O(n) extraction instead of scanning all batches.
+//
+// Lifecycle note: for each uncommitted batch we ALSO remove its
+// transactions from txIndex before returning. Without this step the
+// downstream txRecoveryCallback re-adds the recovered txs via
+// workerPool.AddTx, but Worker.AddTx silently drops any tx whose
+// hash is already indexed (the "Already batched" idempotency path).
+// The txs would be lost: extractUncommittedTxs returns them, the
+// callback fires, every recovered tx hits HasTx=true, all of them are
+// dropped — 19% loss observed in TestPhaseE_MultiBlockTPS (PLAN §E6).
+// Removing here keeps the recovery callback's contract honest:
+// "recovered tx will be re-added".
 func (gc *GCManager) extractUncommittedTxs(beforeRound uint64) []types.Transaction {
 	var uncommittedTxs []types.Transaction
 	var batchesToRemove []types.Hash
@@ -308,6 +319,15 @@ func (gc *GCManager) extractUncommittedTxs(beforeRound uint64) []types.Transacti
 		delete(gc.uncommittedBatches, digest)
 	}
 	gc.uncommittedBatchesMu.Unlock()
+
+	// Clear txIndex entries for the uncommitted batches so the recovery
+	// callback can re-add the txs. Best-effort: a failure here only
+	// causes the txs to be skipped on re-add, no correctness impact.
+	if gc.txIndex != nil {
+		for _, digest := range batchesToRemove {
+			_ = gc.txIndex.RemoveTxsForBatch(digest)
+		}
+	}
 
 	// If index was empty, fall back to scanning (for backwards compatibility)
 	if len(uncommittedTxs) == 0 && len(batchesToRemove) == 0 {
@@ -346,10 +366,15 @@ func (gc *GCManager) extractUncommittedTxsFallback(beforeRound uint64) []types.T
 			}
 		}
 
-		// Extract transactions from uncommitted batches
+		// Extract transactions from uncommitted batches and clear their
+		// txIndex entries so the recovery callback's re-add path can
+		// succeed (see lifecycle note on extractUncommittedTxs).
 		for _, batch := range batches {
 			if !committedBatches[batch.Digest] {
 				uncommittedTxs = append(uncommittedTxs, batch.Transactions...)
+				if gc.txIndex != nil {
+					_ = gc.txIndex.RemoveTxsForBatch(batch.Digest)
+				}
 			}
 		}
 	}
