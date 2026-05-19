@@ -1,6 +1,7 @@
 package looseberry
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"runtime/debug"
@@ -102,10 +103,16 @@ type Looseberry struct {
 	// Transaction validation
 	txValidator TxValidator
 
+	// Observability hooks (optional).
+	// ackQuorumCallback fires when any tracked batch reaches ack quorum;
+	// raspberry wires it to a Prometheus histogram.
+	ackQuorumCallback worker.QuorumCallback
+
 	// Core components
 	workerPool     *worker.Pool
 	workerScaler   *worker.Scaler
 	primaryNode    *primary.Primary
+	batchFetcher   *primary.BatchFetcher
 	dag            *dag.DAG
 	syncManager    *network.SyncManager
 	gcManager      *gc.GCManager
@@ -124,12 +131,38 @@ type Looseberry struct {
 	totalTxRejected atomic.Uint64
 	totalBatches    atomic.Uint64
 
+	// Out-of-order cert buffer (PLAN §E7).
+	//
+	// Cert messages and the cert chain they reference can arrive out of
+	// order under burst load — round-N+1 cert showing up before its
+	// round-N parents because broadcasts are async and per-stream
+	// independent. dag.AddCertificate rejects orphan certs with
+	// ErrMissingParents, and handleCertificateMessage previously
+	// discarded that error silently — so a peer would never get the
+	// orphan cert again. The DAG would stall at the round that the
+	// missing parents would otherwise have populated, and every block
+	// thereafter would be empty because ReapCertifiedBatches couldn't
+	// see past the stuck round.
+	//
+	// orphanCerts buffers those orphans. Whenever a cert lands
+	// successfully, we replay every orphan: any whose parents are now
+	// present will add this pass; the rest stay buffered for the next
+	// successful add. orphanCertCap bounds the buffer so a malicious
+	// peer can't pump orphans forever.
+	orphanCerts   map[types.Hash]*types.Certificate
+	orphanCertsMu sync.Mutex
+
 	// Lifecycle
 	running atomic.Bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 	mu      sync.RWMutex
 }
+
+// orphanCertCap bounds the number of orphan certificates the looseberry
+// instance will hold awaiting their parents. Far higher than any healthy
+// scenario needs; small enough that a malicious peer can't bloat memory.
+const orphanCertCap = 4096
 
 // New creates a new Looseberry instance.
 func New(cfg *Config) (*Looseberry, error) {
@@ -141,6 +174,7 @@ func New(cfg *Config) (*Looseberry, error) {
 		cfg:         cfg,
 		txValidator: cfg.TxValidator,
 		stopCh:      make(chan struct{}),
+		orphanCerts: make(map[types.Hash]*types.Certificate),
 	}
 
 	return l, nil
@@ -158,6 +192,26 @@ func (l *Looseberry) SetNetwork(net network.Network) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.network = net
+}
+
+// SetAckQuorumCallback installs an observability hook fired the moment
+// any tracked batch's ack count first reaches quorum. Passes the batch
+// digest and the wall-clock latency from batch creation to quorum. Must
+// be cheap and non-blocking — the callback runs under the AckTracker
+// mutex.
+//
+// Used by raspberry's observability layer to drive the
+// raspberry_batch_ack_latency_seconds histogram. Must be called before
+// Start() to attach to the initial worker set; the same callback is
+// applied to any worker created later via ScaleUp.
+func (l *Looseberry) SetAckQuorumCallback(cb worker.QuorumCallback) {
+	l.mu.Lock()
+	l.ackQuorumCallback = cb
+	pool := l.workerPool
+	l.mu.Unlock()
+	if pool != nil {
+		pool.SetAckQuorumCallback(cb)
+	}
 }
 
 // SetStores sets the storage implementations.
@@ -250,7 +304,15 @@ func (l *Looseberry) initializeStores() error {
 	}
 
 	if l.txIndex == nil {
-		l.txIndex = store.NewMemoryTxIndex()
+		if l.cfg.Storage.InMemory {
+			l.txIndex = store.NewMemoryTxIndex()
+		} else {
+			ti, err := store.NewLevelDBTxIndex(l.cfg.Storage.DataDir + "/txindex")
+			if err != nil {
+				return fmt.Errorf("create tx index: %w", err)
+			}
+			l.txIndex = ti
+		}
 	}
 
 	return nil
@@ -287,6 +349,11 @@ func (l *Looseberry) initializeComponents() error {
 	// Set batch callback
 	l.workerPool.SetBatchCallback(l.onBatchCreated)
 
+	// Forward any pre-Start ack-quorum observability hook to the pool.
+	if l.ackQuorumCallback != nil {
+		l.workerPool.SetAckQuorumCallback(l.ackQuorumCallback)
+	}
+
 	// Set tx validator
 	if l.txValidator != nil {
 		l.workerPool.SetTxValidator(worker.TxValidator(l.txValidator))
@@ -322,6 +389,19 @@ func (l *Looseberry) initializeComponents() error {
 	l.primaryNode.SetHeaderCallback(l.onHeaderCreated)
 	l.primaryNode.SetVoteCallback(l.onVoteCreated)
 	l.primaryNode.SetCertificateCallback(l.onCertificateFormed)
+
+	// Wire the data-availability gate: the primary will only include a
+	// batch digest in a new header after 2f+1 acks (B3-2 / T1-2).
+	l.primaryNode.SetAckQuorumChecker(l.workerPool)
+
+	// Create batch fetcher. It owns the "missing batch → request from peer"
+	// loop that was previously a TODO in HandleHeader (T1-3 / B3-1, B3-3).
+	bfCfg := primary.DefaultBatchFetcherConfig()
+	l.batchFetcher = primary.NewBatchFetcher(bfCfg, l.batchStore)
+	l.batchFetcher.SetRequestCallback(l.onBatchRequest)
+	l.batchFetcher.SetHeaderReadyCallback(l.onHeaderReady)
+	l.primaryNode.SetBatchFetcher(l.batchFetcher)
+	l.batchFetcher.UpdateValidators(l.peerValidatorIndices())
 
 	// Create sync manager
 	syncCfg := network.SyncConfig{
@@ -368,8 +448,17 @@ func (l *Looseberry) startComponents() error {
 		return fmt.Errorf("start primary: %w", err)
 	}
 
+	// Start batch fetcher
+	if err := l.batchFetcher.Start(); err != nil {
+		_ = l.primaryNode.Stop()
+		_ = l.workerScaler.Stop()
+		_ = l.workerPool.Stop()
+		return fmt.Errorf("start batch fetcher: %w", err)
+	}
+
 	// Start sync manager
 	if err := l.syncManager.Start(); err != nil {
+		_ = l.batchFetcher.Stop()
 		_ = l.primaryNode.Stop()
 		_ = l.workerScaler.Stop()
 		_ = l.workerPool.Stop()
@@ -379,6 +468,7 @@ func (l *Looseberry) startComponents() error {
 	// Start GC manager
 	if err := l.gcManager.Start(); err != nil {
 		_ = l.syncManager.Stop()
+		_ = l.batchFetcher.Stop()
 		_ = l.primaryNode.Stop()
 		_ = l.workerScaler.Stop()
 		_ = l.workerPool.Stop()
@@ -395,6 +485,9 @@ func (l *Looseberry) stopComponents() {
 	}
 	if l.syncManager != nil {
 		_ = l.syncManager.Stop()
+	}
+	if l.batchFetcher != nil {
+		_ = l.batchFetcher.Stop()
 	}
 	if l.primaryNode != nil {
 		_ = l.primaryNode.Stop()
@@ -457,13 +550,24 @@ func (l *Looseberry) AddTx(tx []byte) error {
 		return types.ErrNotRunning
 	}
 
-	// Check flow control
-	if l.flowController.IsPaused() {
+	// Check flow control. The flowController is allocated in Start(); a
+	// caller can race with Start/Stop and observe a nil pointer here, so
+	// the guard mirrors the pattern used elsewhere in this file (e.g.
+	// UpdateCommittedRound at line 586). Pre-existing nil-deref flagged by
+	// raspberry's tests/integration/{chaos,e2e}_test.go.
+	if l.flowController != nil && l.flowController.IsPaused() {
 		l.totalTxRejected.Add(1)
 		return types.ErrFlowControlPaused
 	}
 
-	// Add to worker pool (validation happens in pool)
+	// Worker pool is allocated in Start(); same race window as flowController
+	// above. Without this guard a tx submission racing Start triggers a nil
+	// receiver panic in (*Pool).AddTx (seen by raspberry tests/integration
+	// e2e_test.go::TestE2E_TransactionSubmission).
+	if l.workerPool == nil {
+		l.totalTxRejected.Add(1)
+		return types.ErrNotRunning
+	}
 	if err := l.workerPool.AddTx(types.Transaction(tx)); err != nil {
 		l.totalTxRejected.Add(1)
 		return err
@@ -482,27 +586,41 @@ func (l *Looseberry) ReapCertifiedBatches(maxBytes int64) []CertifiedBatch {
 		return nil
 	}
 
-	// Get committed round
-	committedRound := l.dag.CommittedRound()
-
-	// Get certificates from committed round + 1 to current
+	// Determine which rounds to reap.
+	// committedRound starts at 0 (zero-value), so we use HasCommitted()
+	// to distinguish "nothing committed yet" from "round 0 committed".
 	currentRound := l.dag.HighestRound()
-	if currentRound <= committedRound {
-		return nil
+	var fromRound uint64
+	if l.dag.HasCommitted() {
+		committedRound := l.dag.CommittedRound()
+		if currentRound <= committedRound {
+			return nil
+		}
+		fromRound = committedRound + 1
 	}
+	// When !HasCommitted(), fromRound stays 0 — include all rounds from the start
 
 	// Get ordered certificates
-	certs := l.dag.GetOrderedCertificates(committedRound+1, currentRound)
+	certs := l.dag.GetOrderedCertificates(fromRound, currentRound)
 	if len(certs) == 0 {
 		return nil
 	}
 
 	var result []CertifiedBatch
 	var totalBytes int64
+	seen := make(map[types.Hash]bool)
 
 	for _, cert := range certs {
 		// Get batches for this certificate
 		for _, batchRef := range cert.Header.BatchRefs {
+			// Dedupe by digest — the same batch can be referenced by multiple
+			// certificates (e.g. when several primaries cite the same batch
+			// in their headers). Returning duplicates would cause double
+			// execution at the block-application layer.
+			if seen[batchRef.Digest] {
+				continue
+			}
+
 			batch, err := l.batchStore.GetBatch(batchRef.Digest)
 			if err != nil || batch == nil {
 				continue
@@ -513,6 +631,7 @@ func (l *Looseberry) ReapCertifiedBatches(maxBytes int64) []CertifiedBatch {
 				return result
 			}
 
+			seen[batchRef.Digest] = true
 			result = append(result, CertifiedBatch{
 				Batch:       batch,
 				Certificate: cert,
@@ -542,6 +661,17 @@ func (l *Looseberry) NotifyCommitted(round uint64) {
 	}
 }
 
+// HighestRound returns the highest certificate round in the DAG.
+func (l *Looseberry) HighestRound() uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if l.dag == nil {
+		return 0
+	}
+	return l.dag.HighestRound()
+}
+
 // UpdateValidatorSet implements DAGMempool.
 func (l *Looseberry) UpdateValidatorSet(validators types.ValidatorSet) {
 	l.mu.Lock()
@@ -562,6 +692,11 @@ func (l *Looseberry) UpdateValidatorSet(validators types.ValidatorSet) {
 	// Update validator set in sync manager
 	if l.syncManager != nil {
 		l.syncManager.UpdateValidatorSet(validators)
+	}
+
+	// Refresh the batch fetcher's peer list so retries pick the new set.
+	if l.batchFetcher != nil {
+		l.batchFetcher.UpdateValidators(l.peerValidatorIndices())
 	}
 }
 
@@ -700,6 +835,12 @@ func (l *Looseberry) messageLoop() {
 		case msg := <-l.network.BatchAckMessages():
 			l.handleBatchAckMessage(msg)
 
+		case req := <-l.network.BatchRequestMessages():
+			l.handleBatchRequestMessage(req)
+
+		case resp := <-l.network.BatchResponseMessages():
+			l.handleBatchResponseMessage(resp)
+
 		case req := <-l.network.SyncRequests():
 			l.handleSyncRequest(req)
 
@@ -728,12 +869,35 @@ func (l *Looseberry) handleBatchMessage(msg *network.BatchMessage) {
 		_ = l.txIndex.AddBatch(msg.Batch)
 	}
 
-	// Send acknowledgment
-	if l.network != nil {
-		_ = l.network.SendBatchAck(msg.From, &network.BatchAckMessage{
+	// Notify the BatchFetcher: a header may have been pending on this batch.
+	if l.batchFetcher != nil {
+		l.batchFetcher.NotifyBatchReceived(msg.Batch)
+	}
+
+	// Send signed acknowledgment. The signature binds (batchDigest, validator,
+	// round) so peers cannot forge or replay acks (T1-4).
+	//
+	// PLAN §E7b: the ack send is dispatched off the messageLoop. A
+	// blocking libp2p Send on a backpressured "looseberry-batch-acks"
+	// stream wedges every other incoming-message handler on this node,
+	// and under multi-source burst that was enough to keep batches
+	// from ever reaching 2f+1 acks → no headers → no certs → empty
+	// blocks forever.
+	if l.network != nil && l.cfg.Signer != nil {
+		ack := &network.BatchAckMessage{
 			BatchDigest: msg.Batch.Digest,
 			Validator:   l.cfg.ValidatorIndex,
-		})
+			Round:       msg.Batch.Round,
+		}
+		signBytes := network.BatchAckSignBytes(ack.BatchDigest, ack.Validator, ack.Round)
+		sig, err := l.cfg.Signer.Sign(signBytes)
+		if err == nil {
+			ack.Signature = sig
+			from := msg.From
+			l.dispatchAsync(func() {
+				_ = l.network.SendBatchAck(from, ack)
+			})
+		}
 	}
 }
 
@@ -766,6 +930,15 @@ func (l *Looseberry) handleVoteMessage(msg *network.VoteMessage) {
 }
 
 // handleCertificateMessage processes incoming certificate messages.
+//
+// Cert ordering note (PLAN §E7): under burst load, certs and their
+// parent certs arrive on separate streams and can land out of order —
+// dag.AddCertificate then returns ErrMissingParents. Previously that
+// error was swallowed and the orphan was permanently dropped, stalling
+// every downstream round at any peer that missed the parent broadcast.
+// We now buffer such orphans and replay every orphan whenever a cert
+// adds cleanly — the new add may have been the missing parent, which
+// unblocks one or more buffered children.
 func (l *Looseberry) handleCertificateMessage(msg *network.CertificateMessage) {
 	if msg == nil || msg.Certificate == nil {
 		return
@@ -778,9 +951,18 @@ func (l *Looseberry) handleCertificateMessage(msg *network.CertificateMessage) {
 		_ = l.primaryNode.HandleCertificate(msg.Certificate)
 	}
 
-	// Add to DAG
+	// Add to DAG; buffer orphans whose parents haven't arrived yet so
+	// they can be replayed once the parents land.
 	if l.dag != nil {
-		_ = l.dag.AddCertificate(msg.Certificate)
+		if err := l.dag.AddCertificate(msg.Certificate); err != nil {
+			if errors.Is(err, types.ErrMissingParents) {
+				l.bufferOrphanCert(msg.Certificate)
+			}
+		} else {
+			// New cert landed — may have been a missing parent for one or
+			// more buffered orphans. Replay them.
+			l.replayOrphanCertsLocked()
+		}
 	}
 
 	// Update flow control
@@ -789,7 +971,62 @@ func (l *Looseberry) handleCertificateMessage(msg *network.CertificateMessage) {
 	}
 }
 
+// bufferOrphanCert stashes a cert whose parents haven't yet arrived.
+// Capped at orphanCertCap so a malicious peer can't OOM us by pumping
+// orphans; once full, additional orphans are silently dropped.
+func (l *Looseberry) bufferOrphanCert(cert *types.Certificate) {
+	l.orphanCertsMu.Lock()
+	defer l.orphanCertsMu.Unlock()
+	if len(l.orphanCerts) >= orphanCertCap {
+		return
+	}
+	digest := cert.Digest()
+	if _, dup := l.orphanCerts[digest]; dup {
+		return
+	}
+	l.orphanCerts[digest] = cert
+}
+
+// replayOrphanCertsLocked attempts to add every buffered orphan to the
+// DAG and removes those that succeeded. Iterates until no progress is
+// made so a chain of stacked orphans drains in a single call. Caller
+// must hold l.mu (RLock or Lock).
+func (l *Looseberry) replayOrphanCertsLocked() {
+	if l.dag == nil {
+		return
+	}
+	for {
+		l.orphanCertsMu.Lock()
+		if len(l.orphanCerts) == 0 {
+			l.orphanCertsMu.Unlock()
+			return
+		}
+		batch := make([]*types.Certificate, 0, len(l.orphanCerts))
+		for _, c := range l.orphanCerts {
+			batch = append(batch, c)
+		}
+		l.orphanCertsMu.Unlock()
+
+		var added int
+		for _, c := range batch {
+			if err := l.dag.AddCertificate(c); err == nil {
+				l.orphanCertsMu.Lock()
+				delete(l.orphanCerts, c.Digest())
+				l.orphanCertsMu.Unlock()
+				added++
+			}
+		}
+		if added == 0 {
+			return // no progress; remaining orphans wait for future adds
+		}
+	}
+}
+
 // handleBatchAckMessage processes incoming batch acknowledgment messages.
+//
+// The signature is verified before the ack is recorded — without this gate
+// any peer can fabricate acks attributed to other validators and bypass
+// the 2f+1 availability requirement (T1-4).
 func (l *Looseberry) handleBatchAckMessage(msg *network.BatchAckMessage) {
 	if msg == nil {
 		return
@@ -798,9 +1035,122 @@ func (l *Looseberry) handleBatchAckMessage(msg *network.BatchAckMessage) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
+	if l.validatorSet == nil {
+		return
+	}
+	validator := l.validatorSet.GetByIndex(msg.Validator)
+	if validator == nil {
+		return
+	}
+	signBytes := network.BatchAckSignBytes(msg.BatchDigest, msg.Validator, msg.Round)
+	if !validator.PublicKey.Verify(signBytes, msg.Signature) {
+		return
+	}
+
 	if l.workerPool != nil {
 		l.workerPool.RecordAck(msg.BatchDigest, msg.Validator)
 	}
+}
+
+// handleBatchRequestMessage serves a peer asking for a batch by digest.
+func (l *Looseberry) handleBatchRequestMessage(req *network.BatchRequestMessage) {
+	if req == nil {
+		return
+	}
+
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if l.network == nil {
+		return
+	}
+
+	resp := &network.BatchResponseMessage{
+		From: l.cfg.ValidatorIndex,
+	}
+	if l.batchStore != nil {
+		if batch, err := l.batchStore.GetBatch(req.BatchDigest); err == nil && batch != nil {
+			resp.Batch = batch
+			resp.Found = true
+		}
+	}
+	_ = l.network.SendBatchResponse(req.Requester, resp)
+}
+
+// handleBatchResponseMessage delivers a batch fetched in response to one of
+// our outstanding BatchFetcher requests.
+func (l *Looseberry) handleBatchResponseMessage(resp *network.BatchResponseMessage) {
+	if resp == nil {
+		return
+	}
+
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if resp.Found && resp.Batch != nil {
+		if l.batchStore != nil {
+			_ = l.batchStore.SaveBatch(resp.Batch)
+		}
+		if l.txIndex != nil {
+			_ = l.txIndex.AddBatch(resp.Batch)
+		}
+	}
+	if l.batchFetcher != nil {
+		l.batchFetcher.HandleBatchResponse(resp.Batch, resp.Found, resp.From)
+	}
+}
+
+// onBatchRequest is the BatchFetcher's request callback. It maps the
+// (preferred validator, digest) pair to a BatchRequest on the wire.
+func (l *Looseberry) onBatchRequest(validator uint16, digest types.Hash) error {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if l.network == nil {
+		return types.ErrNotRunning
+	}
+	return l.network.SendBatchRequest(validator, &network.BatchRequestMessage{
+		BatchDigest: digest,
+		Requester:   l.cfg.ValidatorIndex,
+	})
+}
+
+// onHeaderReady is invoked by the BatchFetcher once every batch referenced
+// by the header has arrived locally. We re-feed the header through the
+// primary, which now finds the batches present and proceeds to vote.
+//
+// Lock note: deliberately does NOT take l.mu — invoked synchronously
+// from batchFetcher.NotifyBatchReceived, which is itself called from
+// handleBatchMessage / handleBatchResponseMessage while those hold
+// l.mu.RLock. Same reentrant-RLock deadlock as onHeaderCreated (PLAN §E4).
+// l.primaryNode is immutable post-init; recoverCallback handles
+// Stop-race nil derefs.
+func (l *Looseberry) onHeaderReady(header *types.Header) {
+	defer recoverCallback("onHeaderReady")
+
+	if l.primaryNode != nil {
+		// Re-deliver without going through the fetcher again: store now
+		// holds every batch, so primary's local fast-path will fire.
+		_ = l.primaryNode.HandleHeader(header)
+	}
+}
+
+// peerValidatorIndices returns every validator index other than ours.
+// Used to seed the BatchFetcher's retry pool.
+func (l *Looseberry) peerValidatorIndices() []uint16 {
+	if l.validatorSet == nil {
+		return nil
+	}
+	me := l.cfg.ValidatorIndex
+	all := l.validatorSet.Validators()
+	out := make([]uint16, 0, len(all))
+	for _, v := range all {
+		if v.Index == me {
+			continue
+		}
+		out = append(out, v.Index)
+	}
+	return out
 }
 
 // handleSyncRequest processes incoming sync request messages.
@@ -832,6 +1182,12 @@ func (l *Looseberry) handleSyncResponse(msg *network.SyncResponseMessage) {
 }
 
 // onBatchCreated is called when a batch is created by a worker.
+//
+// The digest is enqueued on the primary, but the primary's tryCreateHeader
+// will not actually include it in a header until the worker's AckTracker
+// reports 2f+1 acks (B3-2 / T1-2). The historical behaviour — immediate
+// inclusion — let a single primary unilaterally certify batches that
+// hadn't been replicated, breaking data-availability.
 func (l *Looseberry) onBatchCreated(batch *types.Batch) {
 	defer recoverCallback("onBatchCreated")
 
@@ -840,7 +1196,9 @@ func (l *Looseberry) onBatchCreated(batch *types.Batch) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	// Add batch digest to primary for header creation
+	// Enqueue digest for the next eligible header. Inclusion is gated by
+	// the AckQuorumChecker wired into the primary; the worker self-acks
+	// inside tryCreateBatch so quorum-of-one topologies still progress.
 	if l.primaryNode != nil {
 		l.primaryNode.AddBatchDigest(types.BatchDigest{
 			WorkerID:    batch.WorkerID,
@@ -856,11 +1214,21 @@ func (l *Looseberry) onBatchCreated(batch *types.Batch) {
 }
 
 // onHeaderCreated is called when a header is created by the primary.
+//
+// Lock note: deliberately does NOT take l.mu — these inner callbacks
+// fire synchronously from primary.HandleVote/HandleHeader/tryCreateHeader,
+// which themselves are invoked from handleVoteMessage/handleHeaderMessage
+// while those hold l.mu.RLock. Go's sync.RWMutex is not reentrant: if
+// any concurrent goroutine (e.g. NotifyCommitted) queues a writer in
+// the meantime, a second RLock attempt here blocks behind that writer,
+// while the outer reader can't release until this callback returns —
+// classic 3-way deadlock. Observed in Phase E under burst load (see
+// PLAN §E4). The fields accessed here (l.network) are set during
+// SetNetwork / initializeComponents before any goroutine that could
+// invoke this callback is spawned, so no synchronization is required.
+// recoverCallback handles the (extremely unlikely) Stop-race nil deref.
 func (l *Looseberry) onHeaderCreated(header *types.Header) {
 	defer recoverCallback("onHeaderCreated")
-
-	l.mu.RLock()
-	defer l.mu.RUnlock()
 
 	// Broadcast header to network
 	if l.network != nil {
@@ -869,24 +1237,52 @@ func (l *Looseberry) onHeaderCreated(header *types.Header) {
 }
 
 // onVoteCreated is called when a vote is created for a header.
+//
+// Lock note: see onHeaderCreated. Same reentrant-RLock deadlock pattern.
+//
+// The vote send is dispatched off the calling goroutine (PLAN §E7b):
+// onVoteCreated fires synchronously from handleHeaderMessage, which
+// runs in messageLoop. A blocking libp2p send on a backpressured
+// "looseberry-votes" stream would otherwise wedge the entire
+// messageLoop and starve every other incoming-message handler — under
+// burst, that's enough to keep round-0 from ever forming a cert.
 func (l *Looseberry) onVoteCreated(vote *types.Vote, targetValidator uint16) {
 	defer recoverCallback("onVoteCreated")
 
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	// Send vote to target validator
-	if l.network != nil {
-		_ = l.network.SendVote(targetValidator, vote)
+	if l.network == nil {
+		return
 	}
+	l.dispatchAsync(func() {
+		_ = l.network.SendVote(targetValidator, vote)
+	})
+}
+
+// dispatchAsync runs fn in a goroutine tracked by l.wg so Stop drains
+// cleanly. Used to keep libp2p send latency off the messageLoop hot
+// path (PLAN §E7b). The goroutine is intentionally unbounded — glueberry
+// already applies per-stream backpressure with a 1000-message high
+// watermark, which gives us natural concurrency limits without adding
+// another bookkeeping layer here.
+func (l *Looseberry) dispatchAsync(fn func()) {
+	if !l.running.Load() {
+		// Don't spawn during shutdown — Stop has already started draining.
+		return
+	}
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		defer recoverCallback("dispatchAsync")
+		fn()
+	}()
 }
 
 // onCertificateFormed is called when a certificate is formed.
+//
+// Lock note: see onHeaderCreated. Same reentrant-RLock deadlock pattern.
+// l.dag, l.flowController and l.network are all set during init and
+// not modified at runtime; recoverCallback catches any Stop-race panic.
 func (l *Looseberry) onCertificateFormed(cert *types.Certificate) {
 	defer recoverCallback("onCertificateFormed")
-
-	l.mu.RLock()
-	defer l.mu.RUnlock()
 
 	// Add to DAG
 	if l.dag != nil {
