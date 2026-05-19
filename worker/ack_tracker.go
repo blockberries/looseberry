@@ -14,15 +14,23 @@ type PendingBatch struct {
 	CreatedAt time.Time
 }
 
+// QuorumCallback is invoked the moment a tracked batch's ack count first
+// reaches the configured quorum. latency is wall-clock from TrackBatch
+// (batch creation) to the quorum-reaching ack. Used by the looseberry
+// observability hook to drive the raspberry_batch_ack_latency_seconds
+// histogram (PLAN follow-up).
+type QuorumCallback func(digest types.Hash, latency time.Duration)
+
 // AckTracker tracks pending batches and their acknowledgments.
 // Thread-safe with RWMutex.
 type AckTracker struct {
-	pending   map[types.Hash]*PendingBatch
-	mu        sync.RWMutex
-	quorum    int           // Required acks for quorum
-	timeout   time.Duration // Timeout for pending batches
-	closed    bool
-	cleanupCh chan struct{} // Signal to stop cleanup goroutine
+	pending        map[types.Hash]*PendingBatch
+	mu             sync.RWMutex
+	quorum         int           // Required acks for quorum
+	timeout        time.Duration // Timeout for pending batches
+	closed         bool
+	cleanupCh      chan struct{} // Signal to stop cleanup goroutine
+	quorumCallback QuorumCallback
 }
 
 // NewAckTracker creates a new acknowledgment tracker.
@@ -60,6 +68,14 @@ func (at *AckTracker) TrackBatch(batch *types.Batch) {
 
 // RecordAck records an acknowledgment from a validator.
 // Returns true if quorum is reached with this ack.
+//
+// When this ack is the one that first lifts the batch's ack count to the
+// configured quorum, the registered QuorumCallback (if any) is invoked
+// synchronously with the batch digest and the wall-clock latency from
+// TrackBatch (batch creation) to now. The callback runs under at.mu, so
+// it must be cheap and non-blocking — typical use is incrementing a
+// Prometheus histogram. Subsequent acks that keep the count at-or-above
+// quorum do NOT re-fire the callback.
 func (at *AckTracker) RecordAck(batchDigest types.Hash, validator uint16) bool {
 	at.mu.Lock()
 	defer at.mu.Unlock()
@@ -78,8 +94,21 @@ func (at *AckTracker) RecordAck(batchDigest types.Hash, validator uint16) bool {
 		return len(pending.Acks) >= at.quorum
 	}
 
+	wasBelow := len(pending.Acks) < at.quorum
 	pending.Acks[validator] = true
-	return len(pending.Acks) >= at.quorum
+	atQuorum := len(pending.Acks) >= at.quorum
+	if wasBelow && atQuorum && at.quorumCallback != nil {
+		at.quorumCallback(batchDigest, time.Since(pending.CreatedAt))
+	}
+	return atQuorum
+}
+
+// SetQuorumCallback installs a callback fired when a tracked batch first
+// reaches quorum. Pass nil to clear.
+func (at *AckTracker) SetQuorumCallback(cb QuorumCallback) {
+	at.mu.Lock()
+	defer at.mu.Unlock()
+	at.quorumCallback = cb
 }
 
 // HasQuorum returns true if the batch has received enough acks.
@@ -117,6 +146,31 @@ func (at *AckTracker) GetPending(batchDigest types.Hash) (*PendingBatch, bool) {
 		Acks:      acksCopy,
 		CreatedAt: pending.CreatedAt,
 	}, true
+}
+
+// PendingBelowQuorum returns deep copies of every batch this AckTracker
+// is still holding that has NOT reached quorum AND was created at least
+// minAge ago. Drives the looseberry instance's startup-aware
+// rebroadcast loop (PLAN §E7c). The minAge filter prevents re-broadcast
+// from racing fresh batches whose first-attempt acks are still in flight.
+func (at *AckTracker) PendingBelowQuorum(minAge time.Duration) []*types.Batch {
+	at.mu.RLock()
+	defer at.mu.RUnlock()
+	if at.closed {
+		return nil
+	}
+	cutoff := time.Now().Add(-minAge)
+	var out []*types.Batch
+	for _, p := range at.pending {
+		if len(p.Acks) >= at.quorum {
+			continue
+		}
+		if !p.CreatedAt.Before(cutoff) {
+			continue
+		}
+		out = append(out, p.Batch.Clone())
+	}
+	return out
 }
 
 // RemoveBatch removes a batch from tracking.

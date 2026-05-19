@@ -44,6 +44,25 @@ type HeaderCallback func(header *types.Header)
 // VoteCallback is called when a vote should be sent.
 type VoteCallback func(vote *types.Vote, to uint16)
 
+// BatchAvailabilityChecker is the subset of *BatchFetcher that Primary needs
+// in order to ask "are all batches for this header available, and if not,
+// please fetch them and call me back when they are". An interface keeps the
+// dependency one-way (primary doesn't import a concrete batch fetcher).
+type BatchAvailabilityChecker interface {
+	// RequestBatchesForHeader returns true if every batch referenced by the
+	// header is already present locally. If it returns false the checker
+	// MUST schedule a fetch and, on success, invoke its HeaderReady callback
+	// with the original header.
+	RequestBatchesForHeader(header *types.Header) bool
+}
+
+// AckQuorumChecker reports whether a batch has been acknowledged by 2f+1
+// validators. Used by Primary.tryCreateHeader to gate inclusion of a batch
+// digest behind data-availability (T1-2 / B3-2).
+type AckQuorumChecker interface {
+	HasBatchAckQuorum(digest types.Hash) bool
+}
+
 // pendingVoteEntry tracks buffered votes with their creation time for cleanup.
 type pendingVoteEntry struct {
 	votes     []types.Vote
@@ -84,6 +103,18 @@ type Primary struct {
 	certCallback   CertificateCallback
 	headerCallback HeaderCallback
 	voteCallback   VoteCallback
+
+	// BatchFetcher is consulted when a header references a batch we don't
+	// have locally; instead of silently skipping the vote (the historical
+	// T1-3 behaviour) the primary now hands the header to the fetcher and
+	// expects it to call us back via the HeaderReadyCallback once every
+	// referenced batch has arrived. Nil means: fall back to the legacy
+	// skip-when-missing behaviour (used by tests that don't wire a fetcher).
+	batchFetcher BatchAvailabilityChecker
+
+	// AckTracker is the worker pool's ack tracker, consulted before
+	// including a batch digest in a new header — see B3-2.
+	ackQuorumChecker AckQuorumChecker
 
 	// Lifecycle
 	running   atomic.Bool
@@ -129,6 +160,20 @@ func (p *Primary) SetHeaderCallback(cb HeaderCallback) {
 // SetVoteCallback sets the callback for sending votes.
 func (p *Primary) SetVoteCallback(cb VoteCallback) {
 	p.voteCallback = cb
+}
+
+// SetBatchFetcher installs a checker used by HandleHeader to request missing
+// batches instead of silently skipping the vote. The checker is expected to
+// invoke HandleHeader (or the equivalent) again once every batch has arrived.
+func (p *Primary) SetBatchFetcher(bf BatchAvailabilityChecker) {
+	p.batchFetcher = bf
+}
+
+// SetAckQuorumChecker installs the data-availability gate used by
+// tryCreateHeader: a batch digest is only included in the next header once
+// 2f+1 validators have acknowledged it.
+func (p *Primary) SetAckQuorumChecker(c AckQuorumChecker) {
+	p.ackQuorumChecker = c
 }
 
 // Start starts the primary's header creation loop.
@@ -208,8 +253,27 @@ func (p *Primary) GetVoteTracker() *VoteTracker {
 	return p.voteTracker
 }
 
+// PendingHeadersOlderThan returns headers locally authored by this
+// primary that are still awaiting quorum votes AND are at least minAge
+// old. Used by the looseberry stuck-detection rebroadcast loop
+// (PLAN §E7c) to retransmit headers whose votes may have been dropped
+// on the wire — the cluster's hard-stall mode at 100K+ shows batches
+// reaching quorum but headers not getting certified.
+func (p *Primary) PendingHeadersOlderThan(minAge time.Duration) []*types.Header {
+	if p.voteTracker == nil {
+		return nil
+	}
+	return p.voteTracker.PendingHeadersOlderThan(minAge)
+}
+
 // HandleHeader processes a received header from another validator.
 // Returns error if header is invalid.
+//
+// When a referenced batch is missing locally, the header is handed to the
+// installed BatchFetcher (if any). The fetcher requests the batch from
+// peers and re-invokes HandleHeader once all batches are available — at
+// which point the second pass falls through to vote-and-send. Without a
+// fetcher (test harness) we fall back to the legacy skip-vote behaviour.
 func (p *Primary) HandleHeader(header *types.Header) error {
 	if !p.running.Load() {
 		return types.ErrNotRunning
@@ -220,12 +284,20 @@ func (p *Primary) HandleHeader(header *types.Header) error {
 		return err
 	}
 
-	// Check batch availability (simplified - just check store)
-	for _, batchRef := range header.BatchRefs {
-		if !p.batchStore.HasBatch(batchRef.Digest) {
-			// In full implementation, would request missing batches
-			// For now, skip voting on headers with missing batches
+	// Check batch availability. If anything is missing, prefer to schedule
+	// fetches via the BatchFetcher rather than dropping the vote silently.
+	if p.batchFetcher != nil {
+		if !p.batchFetcher.RequestBatchesForHeader(header) {
+			// Fetch in progress; the fetcher's HeaderReady callback will
+			// route the header back here once every batch has arrived.
 			return nil
+		}
+	} else {
+		for _, batchRef := range header.BatchRefs {
+			if !p.batchStore.HasBatch(batchRef.Digest) {
+				// No fetcher installed — preserve historical behaviour.
+				return nil
+			}
 		}
 	}
 
@@ -385,27 +457,62 @@ func (p *Primary) tryAdvanceRound() bool {
 }
 
 // tryCreateHeader attempts to create a header.
+//
+// Per B3-2 (T1-2), a batch digest is only included once an external
+// AckQuorumChecker reports 2f+1 acks for it. Pending digests that have
+// not yet reached quorum are left in p.batchDigests for a future tick.
+// Digests are kept in FIFO order so older batches are preferred.
+//
+// We deliberately release p.digestsMu before calling HasBatchAckQuorum —
+// the checker may take its own locks (e.g. worker.Pool.workersMu) and
+// holding digestsMu across an external call would invert the lock order
+// elsewhere in the system.
 func (p *Primary) tryCreateHeader() {
 	if !p.running.Load() {
 		return
 	}
 
-	// Get batch digests
+	// Snapshot the queue. We'll re-acquire the lock later to merge the
+	// remainder back in.
 	p.digestsMu.Lock()
 	if len(p.batchDigests) == 0 && !p.cfg.AllowEmptyHeaders {
 		p.digestsMu.Unlock()
 		return
 	}
-
-	// Take up to MaxBatchesPerHeader
-	var digests []types.BatchDigest
-	if len(p.batchDigests) > 0 {
-		count := min(len(p.batchDigests), p.cfg.MaxBatchesPerHeader)
-		digests = make([]types.BatchDigest, count)
-		copy(digests, p.batchDigests[:count])
-		p.batchDigests = p.batchDigests[count:]
-	}
+	snapshot := make([]types.BatchDigest, len(p.batchDigests))
+	copy(snapshot, p.batchDigests)
+	p.batchDigests = p.batchDigests[:0]
 	p.digestsMu.Unlock()
+
+	var digests []types.BatchDigest
+	if len(snapshot) > 0 {
+		// Walk the queue once, splitting into "ready" (quorum acked) and
+		// "still waiting".
+		remaining := make([]types.BatchDigest, 0, len(snapshot))
+		ready := make([]types.BatchDigest, 0, p.cfg.MaxBatchesPerHeader)
+
+		for _, d := range snapshot {
+			if len(ready) >= p.cfg.MaxBatchesPerHeader {
+				remaining = append(remaining, d)
+				continue
+			}
+			if p.ackQuorumChecker == nil || p.ackQuorumChecker.HasBatchAckQuorum(d.Digest) {
+				ready = append(ready, d)
+				continue
+			}
+			remaining = append(remaining, d)
+		}
+
+		digests = ready
+
+		// Restore the still-waiting digests. They go at the front of any
+		// newer digests that may have arrived while we were classifying.
+		if len(remaining) > 0 {
+			p.digestsMu.Lock()
+			p.batchDigests = append(remaining, p.batchDigests...)
+			p.digestsMu.Unlock()
+		}
+	}
 
 	// Build header
 	round := p.currentRound.Load()
@@ -425,10 +532,32 @@ func (p *Primary) tryCreateHeader() {
 	// Track header for votes
 	p.voteTracker.TrackHeader(header)
 
-	// Process any pending votes
+	// Self-vote: every validator votes on its own headers
+	selfVote := types.NewVote(header.Digest, p.validatorID)
+	if err := selfVote.Sign(p.signer); err == nil {
+		p.validatorMu.RLock()
+		quorum := p.validatorSet.Quorum()
+		p.validatorMu.RUnlock()
+
+		cert, formed := p.voteTracker.RecordVote(selfVote, quorum)
+		if formed {
+			if p.certStore != nil {
+				_ = p.certStore.SaveCertificate(cert)
+			}
+			p.voteTracker.RemoveHeader(header.Digest)
+			if p.certCallback != nil {
+				p.certCallback(cert)
+			}
+			// Advance round after self-certification so the next header
+			// moves to the next round (critical for single-validator setups)
+			p.tryAdvanceRound()
+		}
+	}
+
+	// Process any pending votes (from other validators that voted early)
 	p.processPendingVotes(header.Digest)
 
-	// Notify callback
+	// Notify callback (broadcast header to other validators)
 	if p.headerCallback != nil {
 		p.headerCallback(header)
 	}

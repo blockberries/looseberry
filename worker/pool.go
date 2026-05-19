@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/blockberries/looseberry/store"
 	"github.com/blockberries/looseberry/types"
@@ -43,8 +44,9 @@ type Pool struct {
 	txIndex    store.TxIndex
 
 	// Callbacks
-	txValidator   TxValidator
-	batchCallback BatchCallback
+	txValidator    TxValidator
+	batchCallback  BatchCallback
+	quorumCallback QuorumCallback
 
 	// Round and epoch (shared state)
 	round atomic.Uint64
@@ -92,6 +94,21 @@ func (p *Pool) SetBatchCallback(callback BatchCallback) {
 	defer p.workersMu.RUnlock()
 	for _, w := range p.workers {
 		w.SetBatchCallback(callback)
+	}
+}
+
+// SetAckQuorumCallback installs an ack-quorum callback on every current
+// and future worker's AckTracker. The callback fires once per tracked
+// batch the moment its ack count first reaches quorum and is intended
+// for observability (drives raspberry_batch_ack_latency_seconds). Pass
+// nil to clear.
+func (p *Pool) SetAckQuorumCallback(callback QuorumCallback) {
+	p.quorumCallback = callback
+
+	p.workersMu.RLock()
+	defer p.workersMu.RUnlock()
+	for _, w := range p.workers {
+		w.SetAckQuorumCallback(callback)
 	}
 }
 
@@ -258,6 +275,39 @@ func (p *Pool) RecordAck(batchDigest types.Hash, validator uint16) bool {
 	return false
 }
 
+// PendingBatchesBelowQuorum aggregates pending-below-quorum batches
+// across every worker. Each batch is at least minAge old. Drives the
+// looseberry instance's startup-aware rebroadcast loop (PLAN §E7c).
+func (p *Pool) PendingBatchesBelowQuorum(minAge time.Duration) []*types.Batch {
+	p.workersMu.RLock()
+	defer p.workersMu.RUnlock()
+	var out []*types.Batch
+	for _, w := range p.workers {
+		out = append(out, w.GetAckTracker().PendingBelowQuorum(minAge)...)
+	}
+	return out
+}
+
+// HasBatchAckQuorum reports whether the batch with the given digest has
+// reached 2f+1 acknowledgments on any worker. Used by Primary to gate
+// batch inclusion in new headers (B3-2 / T1-2).
+//
+// A digest unknown to every worker returns false: this is the correct
+// behaviour because such a batch cannot have any acks counted yet either
+// (the local node hasn't tracked it), and including it in a header would
+// trigger data-availability failures downstream.
+func (p *Pool) HasBatchAckQuorum(batchDigest types.Hash) bool {
+	p.workersMu.RLock()
+	defer p.workersMu.RUnlock()
+
+	for _, w := range p.workers {
+		if w.GetAckTracker().HasQuorum(batchDigest) {
+			return true
+		}
+	}
+	return false
+}
+
 // ScaleUp adds a new worker if below maximum.
 // Returns true if a worker was added.
 func (p *Pool) ScaleUp() bool {
@@ -363,6 +413,9 @@ func (p *Pool) addWorkerLocked() error {
 	}
 	if p.batchCallback != nil {
 		w.SetBatchCallback(p.batchCallback)
+	}
+	if p.quorumCallback != nil {
+		w.SetAckQuorumCallback(p.quorumCallback)
 	}
 
 	if err := w.Start(); err != nil {

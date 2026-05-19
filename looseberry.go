@@ -93,6 +93,16 @@ type Metrics struct {
 
 	// Certificate metrics
 	TotalCertificates uint64
+
+	// Rebroadcast metrics (PLAN §E7c). Each time the stuck-detection
+	// loop fires, RebroadcastFires increments by one and the per-item
+	// counters increment by the number of batches/headers re-emitted
+	// on that fire. All stay at zero on healthy clusters; non-zero
+	// counts are the signal that the cluster is hitting the slow-path
+	// recovery code path.
+	RebroadcastFires     uint64
+	RebroadcastedBatches uint64
+	RebroadcastedHeaders uint64
 }
 
 // Looseberry is the main DAG-based mempool implementation.
@@ -130,6 +140,39 @@ type Looseberry struct {
 	totalTxAdded    atomic.Uint64
 	totalTxRejected atomic.Uint64
 	totalBatches    atomic.Uint64
+
+	// Startup-aware stuck-detection state for the rebroadcast loop
+	// (PLAN §E7c). Three preconditions gate the rebroadcast trigger so
+	// it can't fire during the cluster's libp2p mesh-warmup window:
+	//
+	//   (a) lastCommittedRound > 0 — at least one commit has happened.
+	//       A cluster that's still forming its first round-0 cert is
+	//       NOT a candidate for rebroadcast (an earlier gated-on-time
+	//       attempt mis-fired here and pushed fast-path runs into
+	//       slow-path because the trigger flooded streams just as they
+	//       were establishing).
+	//
+	//   (b) time.Since(startNanos) > rebroadcastStartupGrace — past the
+	//       libp2p mesh-formation window.
+	//
+	//   (c) time.Since(lastCommitNanos) > stuckRebroadcastThreshold —
+	//       no commit progress in long enough to look stuck.
+	//
+	// All three must be true for the loop to fire. Net: healthy
+	// fast-path runs (which commit early and continuously) never
+	// trigger; slow-path runs that recovered initial commit but then
+	// stalled DO trigger, accelerating their drain.
+	startNanos         atomic.Int64
+	lastCommitNanos    atomic.Int64
+	lastCommittedRound atomic.Uint64
+
+	// Observability counters for the rebroadcast loop. Stay zero on
+	// healthy clusters; non-zero means stuck-detection has fired and
+	// the cluster has been auto-recovering via re-emission. Exposed
+	// via Metrics().
+	totalRebroadcastFires     atomic.Uint64
+	totalRebroadcastedBatches atomic.Uint64
+	totalRebroadcastedHeaders atomic.Uint64
 
 	// Out-of-order cert buffer (PLAN §E7).
 	//
@@ -274,7 +317,142 @@ func (l *Looseberry) Start() error {
 	l.wg.Add(1)
 	go l.messageLoop()
 
+	// Capture Start time for the startup-aware rebroadcast grace
+	// (PLAN §E7c). Reset on every Start so Stop/Start cycles get a
+	// fresh grace window. Seed lastCommitNanos to the same value so
+	// the stuck-detection check has a meaningful baseline even when
+	// no commit has happened yet — important for hard-stall clusters
+	// (round-0 never forms) where rebroadcast should still fire after
+	// the startup grace + stuck threshold has elapsed.
+	now := time.Now().UnixNano()
+	l.startNanos.Store(now)
+	l.lastCommitNanos.Store(now)
+
+	// Start the startup-aware rebroadcast loop.
+	l.wg.Add(1)
+	go l.rebroadcastLoop()
+
 	return nil
+}
+
+// Rebroadcast-loop tuning. The three thresholds compose:
+//
+//   - rebroadcastStartupGrace: don't fire for the first 15 s after
+//     Start. This is the window during which libp2p streams establish,
+//     batches get their first acks, and the round-0 cert forms. Firing
+//     during this window adds a synchronized re-emission burst onto
+//     streams that are still warming up — observed to push fast-path
+//     runs into slow-path on TestPhaseE_HighBurstSweep/100k-4-source.
+//
+//   - stuckRebroadcastThreshold: don't fire unless committedRound has
+//     been frozen for at least 3 s past its last advance. Healthy
+//     clusters commit every ~1 s, so this never fires on a normally-
+//     progressing cluster.
+//
+//   - rebroadcastMinAge: don't re-emit a batch whose acks may still
+//     legitimately be in flight (the AckTracker's freshness filter).
+//
+// Plus: lastCommittedRound must be > 0 before the loop can fire AT
+// ALL — a cluster that's never committed isn't a candidate.
+const (
+	rebroadcastInterval       = 1 * time.Second
+	rebroadcastStartupGrace   = 15 * time.Second
+	stuckRebroadcastThreshold = 3 * time.Second
+	rebroadcastMinAge         = 2 * time.Second
+)
+
+// rebroadcastLoop polls the gate every tick and, when the cluster has
+// (a) cleared startup grace, (b) made at least one commit, and (c)
+// gone too long without commit progress, re-broadcasts the locally-
+// pending batches that have not yet reached ack quorum. Peers receive
+// the duplicate batch, store it idempotently, and send fresh signed
+// acks; the batch reaches quorum and the cluster resumes.
+func (l *Looseberry) rebroadcastLoop() {
+	defer l.wg.Done()
+
+	ticker := time.NewTicker(rebroadcastInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-l.stopCh:
+			return
+		case <-ticker.C:
+			l.rebroadcastIfStuck()
+		}
+	}
+}
+
+func (l *Looseberry) rebroadcastIfStuck() {
+	// Gate (a): past the startup grace window. Reading the atomic is
+	// cheap; this comparison is hit on every tick of every healthy
+	// looseberry, so the check stays fast.
+	startNanos := l.startNanos.Load()
+	if startNanos == 0 {
+		return
+	}
+	if time.Since(time.Unix(0, startNanos)) < rebroadcastStartupGrace {
+		return
+	}
+	// Gate (b): committedRound has been frozen long enough to look stuck.
+	// lastCommitNanos is seeded at Start, so if no commit has happened
+	// yet, this is time.Since(start) — which is >= rebroadcastStartupGrace
+	// by gate (a). Hard-stalled clusters (no round-0 cert formed) hit
+	// this path; we re-broadcast their pending batches in case the
+	// original acks got dropped during mesh warm-up. Healthy clusters
+	// commit every ~1 s so this never elapses on them.
+	lastNanos := l.lastCommitNanos.Load()
+	if time.Since(time.Unix(0, lastNanos)) < stuckRebroadcastThreshold {
+		return
+	}
+
+	l.mu.RLock()
+	pool := l.workerPool
+	net := l.network
+	l.mu.RUnlock()
+	if pool == nil || net == nil {
+		return
+	}
+
+	// Look up candidates at BOTH levels (PLAN §E7c). The 100K hard-stall
+	// case showed batches reaching quorum but headers not getting
+	// certified — a batch-only rebroadcast misses that failure mode.
+	batches := pool.PendingBatchesBelowQuorum(rebroadcastMinAge)
+	l.mu.RLock()
+	primary := l.primaryNode
+	l.mu.RUnlock()
+	var headers []*types.Header
+	if primary != nil {
+		headers = primary.PendingHeadersOlderThan(rebroadcastMinAge)
+	}
+
+	if len(batches) == 0 && len(headers) == 0 {
+		return
+	}
+
+	// Observability: bump the fire counter once per stuck-detection
+	// firing and bump the work counters by however many items we
+	// re-emit. These flow through Metrics() so production can see
+	// whether the cluster is hitting the recovery path.
+	l.totalRebroadcastFires.Add(1)
+	l.totalRebroadcastedBatches.Add(uint64(len(batches)))
+	l.totalRebroadcastedHeaders.Add(uint64(len(headers)))
+
+	// Dispatch via the existing async helper so a backpressured stream
+	// can't park this loop. Glueberry's per-stream flow control is the
+	// natural concurrency limit.
+	for _, b := range batches {
+		batch := b
+		l.dispatchAsync(func() {
+			_ = net.BroadcastBatch(batch)
+		})
+	}
+	for _, h := range headers {
+		header := h
+		l.dispatchAsync(func() {
+			_ = net.BroadcastHeader(header)
+		})
+	}
 }
 
 // initializeStores creates storage if not already set.
@@ -659,6 +837,14 @@ func (l *Looseberry) NotifyCommitted(round uint64) {
 	if l.gcManager != nil {
 		_ = l.gcManager.NotifyCommitted(round)
 	}
+
+	// Startup-aware stuck-detection (PLAN §E7c): record the wall-clock
+	// instant of every strictly-higher committedRound so rebroadcastLoop
+	// can decide whether the cluster is making progress.
+	if round > l.lastCommittedRound.Load() {
+		l.lastCommittedRound.Store(round)
+		l.lastCommitNanos.Store(time.Now().UnixNano())
+	}
 }
 
 // HighestRound returns the highest certificate round in the DAG.
@@ -774,9 +960,12 @@ func (l *Looseberry) Metrics() *Metrics {
 	defer l.mu.RUnlock()
 
 	m := &Metrics{
-		TotalTxAdded:    l.totalTxAdded.Load(),
-		TotalTxRejected: l.totalTxRejected.Load(),
-		TotalBatches:    l.totalBatches.Load(),
+		TotalTxAdded:         l.totalTxAdded.Load(),
+		TotalTxRejected:      l.totalTxRejected.Load(),
+		TotalBatches:         l.totalBatches.Load(),
+		RebroadcastFires:     l.totalRebroadcastFires.Load(),
+		RebroadcastedBatches: l.totalRebroadcastedBatches.Load(),
+		RebroadcastedHeaders: l.totalRebroadcastedHeaders.Load(),
 	}
 
 	if l.workerPool != nil {

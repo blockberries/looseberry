@@ -185,6 +185,32 @@ func (vt *VoteTracker) RemoveHeader(digest types.Hash) {
 	delete(vt.pending, digest)
 }
 
+// PendingHeadersOlderThan returns deep copies of every header still
+// tracked (not yet certified, not yet timed out) that was created at
+// least minAge ago. Used by the looseberry stuck-detection rebroadcast
+// loop (PLAN §E7c) to retransmit headers that may have had votes
+// dropped on the wire — peers receive a duplicate, validate batches
+// idempotently, and re-vote.
+//
+// The minAge filter prevents the loop from racing fresh headers whose
+// first-attempt votes are still legitimately in flight.
+func (vt *VoteTracker) PendingHeadersOlderThan(minAge time.Duration) []*types.Header {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+	if vt.closed {
+		return nil
+	}
+	cutoff := time.Now().Add(-minAge)
+	var out []*types.Header
+	for _, p := range vt.pending {
+		if !p.CreatedAt.Before(cutoff) {
+			continue
+		}
+		out = append(out, p.Header.Clone())
+	}
+	return out
+}
+
 // GetPendingCount returns the number of pending headers.
 func (vt *VoteTracker) GetPendingCount() int {
 	vt.mu.RLock()
