@@ -283,3 +283,69 @@ func TestAckTrackerConcurrency(t *testing.T) {
 		t.Errorf("Expected 10 acks, got %d", at.AckCount(batch.Digest))
 	}
 }
+
+func TestAckTrackerQuorumCallback(t *testing.T) {
+	at := NewAckTracker(3, 30*time.Second)
+	defer at.Close()
+
+	var fires int
+	var lastDigest types.Hash
+	var lastLatency time.Duration
+	at.SetQuorumCallback(func(digest types.Hash, latency time.Duration) {
+		fires++
+		lastDigest = digest
+		lastLatency = latency
+	})
+
+	batch := types.NewBatch(0, 0, 1, nil)
+	at.TrackBatch(batch)
+
+	at.RecordAck(batch.Digest, 0)
+	at.RecordAck(batch.Digest, 1)
+	if fires != 0 {
+		t.Fatalf("callback fired before quorum: %d", fires)
+	}
+
+	at.RecordAck(batch.Digest, 2)
+	if fires != 1 {
+		t.Fatalf("callback should fire once at quorum, got %d", fires)
+	}
+	if !lastDigest.Equal(batch.Digest) {
+		t.Fatal("callback received wrong digest")
+	}
+	if lastLatency < 0 {
+		t.Fatalf("latency must be non-negative, got %v", lastLatency)
+	}
+
+	// Above-quorum acks do not re-fire.
+	at.RecordAck(batch.Digest, 3)
+	at.RecordAck(batch.Digest, 4)
+	if fires != 1 {
+		t.Fatalf("callback re-fired above quorum: %d", fires)
+	}
+}
+
+func TestAckTrackerQuorumCallback_DuplicateAck(t *testing.T) {
+	at := NewAckTracker(2, 30*time.Second)
+	defer at.Close()
+
+	var fires int
+	at.SetQuorumCallback(func(digest types.Hash, latency time.Duration) {
+		fires++
+	})
+
+	batch := types.NewBatch(0, 0, 1, nil)
+	at.TrackBatch(batch)
+
+	at.RecordAck(batch.Digest, 0)
+	at.RecordAck(batch.Digest, 0) // duplicate — must not change state
+	if fires != 0 {
+		t.Fatalf("callback fired on duplicate ack: %d", fires)
+	}
+
+	at.RecordAck(batch.Digest, 1)
+	if fires != 1 {
+		t.Fatalf("callback should fire exactly once, got %d", fires)
+	}
+}
+

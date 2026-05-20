@@ -1,6 +1,8 @@
 package network
 
 import (
+	"encoding/binary"
+
 	"github.com/blockberries/looseberry/types"
 )
 
@@ -11,10 +13,33 @@ type BatchMessage struct {
 }
 
 // BatchAckMessage represents a batch acknowledgment.
+//
+// The Signature is computed by the validator at index Validator over the
+// canonical sign-bytes returned by BatchAckSignBytes. Verifying handlers
+// MUST check this signature before recording the ack — otherwise any peer
+// can forge acks on behalf of any validator and trick the primary into
+// believing a batch has 2f+1 acks when it doesn't (T1-4).
 type BatchAckMessage struct {
 	BatchDigest types.Hash
 	Validator   uint16
+	Round       uint64
 	Signature   types.Signature
+}
+
+// BatchAckSignBytes returns the canonical bytes that a batch ack signs over.
+// Format: SHA256(batchDigest || validatorIndex (BE u16) || round (BE u64)).
+//
+// The hash includes the round so a replay of an ack from an earlier round
+// cannot be reused against a different batch in a later round.
+func BatchAckSignBytes(batchDigest types.Hash, validator uint16, round uint64) types.Hash {
+	buf := make([]byte, 0, types.HashSize+2+8)
+	buf = append(buf, batchDigest[:]...)
+	scratch := make([]byte, 8)
+	binary.BigEndian.PutUint16(scratch[:2], validator)
+	buf = append(buf, scratch[:2]...)
+	binary.BigEndian.PutUint64(scratch, round)
+	buf = append(buf, scratch...)
+	return types.HashBytes(buf)
 }
 
 // BatchRequestMessage represents a request for a batch.

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,6 +112,13 @@ func (w *Worker) SetBatchCallback(callback BatchCallback) {
 	w.batchCallback = callback
 }
 
+// SetAckQuorumCallback installs a callback fired when this worker's
+// AckTracker first observes quorum for a tracked batch. Forwards to
+// the AckTracker; pass nil to clear.
+func (w *Worker) SetAckQuorumCallback(cb QuorumCallback) {
+	w.ackTracker.SetQuorumCallback(cb)
+}
+
 // Start starts the worker's batch creation loop.
 func (w *Worker) Start() error {
 	if w.running.Swap(true) {
@@ -185,7 +193,7 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 	// Validate transaction if validator is set
 	if w.txValidator != nil {
 		if err := w.txValidator(tx); err != nil {
-			return types.ErrTxValidationFailed
+			return fmt.Errorf("%w: %v", types.ErrTxValidationFailed, err)
 		}
 	}
 
@@ -395,6 +403,14 @@ func (w *Worker) tryCreateBatch() {
 
 	// Track for acks
 	w.ackTracker.TrackBatch(batch)
+
+	// Self-ack: the creator implicitly acks its own batch — the data is
+	// trivially available locally. Without this, in topologies where the
+	// quorum count equals or exceeds the number of remote acks the primary
+	// could observe (e.g. 1-of-1, 2-of-2 development setups), the batch
+	// would never reach quorum and tryCreateHeader would never include it
+	// (B3-2).
+	w.ackTracker.RecordAck(batch.Digest, w.validatorID)
 
 	// Notify callback
 	if w.batchCallback != nil {

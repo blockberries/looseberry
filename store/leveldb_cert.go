@@ -1,12 +1,11 @@
 package store
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"sync"
 
+	"github.com/blockberries/cramberry/pkg/cramberry"
 	"github.com/blockberries/looseberry/types"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -363,21 +362,18 @@ func parseRoundFromCertKey(key []byte) uint64 {
 	return binary.BigEndian.Uint64(key[prefixLen : prefixLen+8])
 }
 
-// Encoding helpers
+// Encoding helpers.
+//
+// Cramberry's reflection-based codec replaces encoding/gob so the on-disk
+// format matches the canonical wire format used elsewhere in the stack.
 
 func encodeCertificate(cert *types.Certificate) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(cert); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return cramberry.Marshal(cert)
 }
 
 func decodeCertificate(data []byte) (*types.Certificate, error) {
 	var cert types.Certificate
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&cert); err != nil {
+	if err := cramberry.Unmarshal(data, &cert); err != nil {
 		return nil, err
 	}
 	return &cert, nil

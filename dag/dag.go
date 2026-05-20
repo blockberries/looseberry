@@ -95,6 +95,7 @@ type DAG struct {
 
 	highestRound   atomic.Uint64
 	committedRound atomic.Uint64
+	hasCommitted   atomic.Bool
 
 	certStore store.CertificateStore
 	cfg       Config
@@ -300,9 +301,21 @@ func (d *DAG) GetRound(round uint64) *RoundData {
 }
 
 // GetCertificatesForRound returns all certificates for a specific round.
+//
+// The certificate snapshot is taken while still holding roundsMu. The earlier
+// implementation released the lock before calling rd.GetAllCertificates,
+// which iterated rd.Certificates under no lock at all — concurrent
+// AddCertificate calls hold roundsMu while writing to the same map, so -race
+// reliably flagged the conflict (surfaced by C1's multinode integration
+// tests). The clone happens outside the lock to keep the critical section
+// short; the intermediate `raw` slice holds pointers we own.
 func (d *DAG) GetCertificatesForRound(round uint64) []*types.Certificate {
 	d.roundsMu.RLock()
 	rd := d.rounds[round]
+	var raw []*types.Certificate
+	if rd != nil {
+		raw = rd.GetAllCertificates()
+	}
 	d.roundsMu.RUnlock()
 
 	if rd == nil {
@@ -316,10 +329,9 @@ func (d *DAG) GetCertificatesForRound(round uint64) []*types.Certificate {
 		return nil
 	}
 
-	// Clone certificates to prevent external modification of internal state
-	certs := rd.GetAllCertificates()
-	cloned := make([]*types.Certificate, len(certs))
-	for i, cert := range certs {
+	// Clone certificates to prevent external modification of internal state.
+	cloned := make([]*types.Certificate, len(raw))
+	for i, cert := range raw {
 		cloned[i] = cert.Clone()
 	}
 	return cloned
@@ -360,9 +372,17 @@ func (d *DAG) CommittedRound() uint64 {
 	return d.committedRound.Load()
 }
 
+// HasCommitted returns true if any round has been committed.
+// This distinguishes the initial state (committedRound=0, nothing committed)
+// from having actually committed round 0.
+func (d *DAG) HasCommitted() bool {
+	return d.hasCommitted.Load()
+}
+
 // SetCommittedRound sets the committed round.
 func (d *DAG) SetCommittedRound(round uint64) {
 	d.committedRound.Store(round)
+	d.hasCommitted.Store(true)
 
 	// Mark rounds as committed
 	d.roundsMu.Lock()

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -349,7 +350,7 @@ func TestPoolTxValidator(t *testing.T) {
 
 	// Empty tx should fail
 	emptyTx := types.Transaction([]byte{})
-	if err := pool.AddTx(emptyTx); err != types.ErrTxValidationFailed {
+	if err := pool.AddTx(emptyTx); !errors.Is(err, types.ErrTxValidationFailed) {
 		t.Errorf("Expected ErrTxValidationFailed, got: %v", err)
 	}
 

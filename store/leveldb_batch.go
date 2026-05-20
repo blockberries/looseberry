@@ -1,12 +1,11 @@
 package store
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"sync"
 
+	"github.com/blockberries/cramberry/pkg/cramberry"
 	"github.com/blockberries/looseberry/types"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -341,21 +340,20 @@ func parseRoundKey(key []byte) (uint64, types.Hash, error) {
 	return round, digest, nil
 }
 
-// Encoding helpers
+// Encoding helpers.
+//
+// Cramberry's reflection-based codec replaces encoding/gob here so that the
+// on-disk format is the same canonical wire format used everywhere else in
+// the stack — this avoids a second, divergent serialization that can drift
+// from the wire encoders.
 
 func encodeBatch(batch *types.Batch) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(batch); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return cramberry.Marshal(batch)
 }
 
 func decodeBatch(data []byte) (*types.Batch, error) {
 	var batch types.Batch
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&batch); err != nil {
+	if err := cramberry.Unmarshal(data, &batch); err != nil {
 		return nil, err
 	}
 	return &batch, nil
