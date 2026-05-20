@@ -847,6 +847,44 @@ func (l *Looseberry) NotifyCommitted(round uint64) {
 	}
 }
 
+// CatchUpPeerCerts re-broadcasts every cert in this validator's local
+// DAG. Designed to be called after a new validator peer registers
+// post-handshake — without it, late-joining peers (the last validator
+// to start, typically v3 in a 4-validator stagger) permanently miss
+// the foundational round-0 certs that were broadcast before they were
+// in our registry. v3 then can't satisfy
+// `primary.tryAdvanceRound()`'s quorum-of-round-0-certs check and
+// stays stuck at CurrentRound=0 forever, even while passively
+// receiving later-round certs via SyncManager catchup.
+//
+// Idempotent on existing peers: dag.AddCertificate dedupes by digest
+// so the re-broadcast adds nothing for peers that already have the
+// certs. The expected fan-out is small at startup (a few certs × a
+// few peers) so the extra load is negligible.
+//
+// Each re-broadcast is dispatched via the existing dispatchAsync
+// helper so a slow peer can't park this call.
+func (l *Looseberry) CatchUpPeerCerts() {
+	l.mu.RLock()
+	dag := l.dag
+	net := l.network
+	l.mu.RUnlock()
+	if dag == nil || net == nil {
+		return
+	}
+	highest := dag.HighestRound()
+	certs := dag.GetOrderedCertificates(0, highest)
+	if len(certs) == 0 {
+		return
+	}
+	for _, cert := range certs {
+		c := cert
+		l.dispatchAsync(func() {
+			_ = net.BroadcastCertificate(c)
+		})
+	}
+}
+
 // HighestRound returns the highest certificate round in the DAG.
 func (l *Looseberry) HighestRound() uint64 {
 	l.mu.RLock()
