@@ -421,11 +421,15 @@ func TestSyncManagerCatchUp(t *testing.T) {
 		t.Fatalf("CatchUp failed: %v", err)
 	}
 
-	// Should have sent sync request
+	// Should have sent sync request. PLAN §E7c: when our DAG is empty
+	// (HighestRound==0), CatchUp uses fromRound=0 — without that, a
+	// validator stuck at round 0 would never ask for round-0 certs
+	// from the peer that CatchUp picks. With a non-empty DAG, CatchUp
+	// uses HighestRound+1.
 	select {
 	case req := <-network2.SyncRequests():
-		if req.FromRound != 1 {
-			t.Errorf("Expected fromRound 1, got %d", req.FromRound)
+		if req.FromRound != 0 {
+			t.Errorf("Expected fromRound 0 (empty DAG => round-0 included), got %d", req.FromRound)
 		}
 		if req.ToRound != 10 {
 			t.Errorf("Expected toRound 10, got %d", req.ToRound)

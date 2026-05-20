@@ -379,7 +379,69 @@ func (l *Looseberry) rebroadcastLoop() {
 			return
 		case <-ticker.C:
 			l.rebroadcastIfStuck()
+			l.syncIfStuck()
 		}
+	}
+}
+
+// syncIfStuck issues fromRound=0 sync requests to all peers when our
+// primary is still at currentRound=0 past a short stuck-grace window.
+// PLAN §E7c residual race: a peer-broadcast of a round-0 cert can be
+// lost on the libp2p substream, AND the initial RequestPeerCatchUp
+// fired at registration may have hit a still-warming-up stream and
+// silently failed. Without this, we wait the full 10 s SyncInterval
+// for checkAndSync to discover we're behind — and even then, that
+// path uses fromRound=localRound+1 in its CatchUp fallback, which
+// skips round 0 entirely.
+//
+// Idempotent on healthy validators (they're past round 0, so the
+// guard skips them). Aggressive grace (2 s, not the 15 s used by
+// rebroadcastIfStuck) because here we want fast round-0 recovery,
+// not protection against re-emitting still-in-flight acks.
+const syncStuckGrace = 2 * time.Second
+
+func (l *Looseberry) syncIfStuck() {
+	startNanos := l.startNanos.Load()
+	if startNanos == 0 {
+		return
+	}
+	if time.Since(time.Unix(0, startNanos)) < syncStuckGrace {
+		return
+	}
+
+	l.mu.RLock()
+	primary := l.primaryNode
+	sm := l.syncManager
+	vs := l.validatorSet
+	l.mu.RUnlock()
+	if primary == nil || sm == nil || vs == nil {
+		return
+	}
+
+	// Only fire if our primary is stuck at round 0. Healthy validators
+	// past round 0 don't need this — they'll catch up via the normal
+	// per-cert broadcast and SyncManager.checkAndSync paths.
+	if primary.Round() != 0 {
+		return
+	}
+
+	// Re-issue from-round-0 sync requests to every peer. Each is a
+	// dispatchAsync so a backpressured peer can't block the others.
+	myID := vs.Validators()[0].Index // any index; replaced below
+	for _, v := range vs.Validators() {
+		if v.Index == l.cfg.ValidatorIndex {
+			myID = v.Index
+			break
+		}
+	}
+	for _, v := range vs.Validators() {
+		if v.Index == myID {
+			continue
+		}
+		idx := v.Index
+		l.dispatchAsync(func() {
+			_ = sm.RequestPeerCatchUp(idx)
+		})
 	}
 }
 
@@ -589,6 +651,16 @@ func (l *Looseberry) initializeComponents() error {
 		SyncTimeout:   l.cfg.Sync.SyncTimeout,
 	}
 	l.syncManager = network.NewSyncManager(l.dag, l.batchStore, l.network, l.validatorSet, syncCfg)
+
+	// Route synced certs through the same path peer-broadcast certs take:
+	// primary.HandleCertificate saves to certStore and calls tryAdvanceRound,
+	// dag.AddCertificate fills the DAG (with orphan buffering for out-of-
+	// order arrivals). Without this, sync responses populated the DAG but
+	// the primary's currentRound never advanced because tryAdvanceRound
+	// reads certStore. See PLAN §E7c.
+	l.syncManager.SetCertReceivedCallback(func(cert *types.Certificate) {
+		l.handleCertificateMessage(&network.CertificateMessage{Certificate: cert})
+	})
 
 	// Create GC manager
 	gcCfg := gc.Config{
@@ -883,6 +955,103 @@ func (l *Looseberry) CatchUpPeerCerts() {
 			_ = net.BroadcastCertificate(c)
 		})
 	}
+}
+
+// SyncDiagnostics returns a snapshot of sync-manager state for diagnosing
+// stuck-validator hard-stalls (PLAN §E7c). Includes peer-observed
+// highest-round map (zero means we never got a sync response from that
+// peer) and pending request retry counts (high counts mean responses
+// keep getting dropped). Safe to call concurrently.
+func (l *Looseberry) SyncDiagnostics() network.SyncDiagnostics {
+	l.mu.RLock()
+	sm := l.syncManager
+	l.mu.RUnlock()
+	if sm == nil {
+		return network.SyncDiagnostics{}
+	}
+	return sm.Diagnostics()
+}
+
+// CertStoreRoundCount returns how many certs are in the certStore for a
+// given round. Useful for diagnosing v3-stuck scenarios where the
+// primary can't advance round because certStore.GetCertificatesByRound
+// returns < quorum (PLAN §E7c).
+func (l *Looseberry) CertStoreRoundCount(round uint64) int {
+	l.mu.RLock()
+	cs := l.certStore
+	l.mu.RUnlock()
+	if cs == nil {
+		return 0
+	}
+	certs, err := cs.GetCertificatesByRound(round)
+	if err != nil {
+		return 0
+	}
+	return len(certs)
+}
+
+// DAGRoundCount returns how many certs are in the DAG for a given
+// round. Compared with CertStoreRoundCount, lets a diagnostic distinguish
+// the two stuck-validator failure modes:
+//   - DAGRoundCount(0) < quorum: round-0 certs never reached this node
+//   - DAGRoundCount(0) ≥ quorum but CertStoreRoundCount(0) < quorum:
+//     certs reached the DAG but primary.HandleCertificate rejected them
+//     (most likely Verify failure)
+func (l *Looseberry) DAGRoundCount(round uint64) int {
+	l.mu.RLock()
+	d := l.dag
+	l.mu.RUnlock()
+	if d == nil {
+		return 0
+	}
+	return len(d.GetCertificatesForRound(round))
+}
+
+// DAGRoundAuthors returns the set of distinct cert authors in the DAG
+// for a given round. Combined with the expected validator count, lets
+// a diagnostic see exactly WHICH peer's cert is missing (e.g., a stuck
+// v3 with `[0 1]` means v3 has v0's and v1's round-0 cert but is
+// missing v2's and its own).
+func (l *Looseberry) DAGRoundAuthors(round uint64) []uint16 {
+	l.mu.RLock()
+	d := l.dag
+	l.mu.RUnlock()
+	if d == nil {
+		return nil
+	}
+	certs := d.GetCertificatesForRound(round)
+	authors := make([]uint16, 0, len(certs))
+	for _, c := range certs {
+		authors = append(authors, c.Author())
+	}
+	return authors
+}
+
+// RequestPeerCatchUp issues an inbound sync request to a freshly-registered
+// peer, asking for everything from round 0. Paired with CatchUpPeerCerts:
+// CatchUpPeerCerts is the PUSH side (we send our DAG to the peer);
+// RequestPeerCatchUp is the PULL side (the peer sends their DAG to us).
+//
+// Without the pull, a newly-started validator whose round-0 certs were
+// never broadcast to it (because it wasn't yet in any peer's registry
+// when the certs were formed) has to wait the full SyncInterval (10s
+// default) for the periodic checkAndSync to discover it's behind. In a
+// 30-second hard-stall test that's at most 2-3 chances; in practice the
+// stuck-target can ride out the test window.
+//
+// The request is non-blocking: dispatched via dispatchAsync. peerIdx is
+// the looseberry validator index, which raspberry's adapter looks up via
+// genesis.FindValidatorIndex.
+func (l *Looseberry) RequestPeerCatchUp(peerIdx uint16) {
+	l.mu.RLock()
+	sm := l.syncManager
+	l.mu.RUnlock()
+	if sm == nil {
+		return
+	}
+	l.dispatchAsync(func() {
+		_ = sm.RequestPeerCatchUp(peerIdx)
+	})
 }
 
 // HighestRound returns the highest certificate round in the DAG.
