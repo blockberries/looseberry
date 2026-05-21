@@ -17,7 +17,10 @@ Tx → Worker Pool → Batches → Primary → Headers → Votes → Certificate
 ```
 
 - **Workers** ingest transactions, hash-route by `binary.BigEndian.Uint64(hash[:8]) % len(workers)`,
-  batch on size / byte / time threshold, and broadcast batches.
+  batch on size / byte / time threshold, and broadcast batches. Each
+  worker's pending pool is a max-priority heap keyed on the
+  `types.TxAdmission` returned by `TxValidator` (FIFO tiebreaker), so
+  priority-fee aware apps land top-paying txs first.
 - **Primary** collects batch digests into Headers, broadcasts, collects
   votes. With 2f+1 votes a Header becomes a Certificate.
 - **DAG** stores Certificates with causal parent links; one cert per
@@ -34,7 +37,11 @@ cfg := looseberry.DefaultConfig()
 cfg.Validator   = mySigner
 cfg.Validators  = validatorSet
 cfg.Network     = myNetwork    // implements looseberry/network.Network
-cfg.TxValidator = func(tx looseberry.Transaction) error { /* ... */ }
+cfg.TxValidator = func(tx []byte) (types.TxAdmission, error) {
+    // priority-fee aware apps: parse tx and return TxAdmission{Priority, Sender}.
+    // FIFO apps: return zero TxAdmission{}, nil — pending pool degrades to insertion order.
+    return types.TxAdmission{}, nil
+}
 
 lb, err := looseberry.New(cfg)
 err = lb.Start(ctx)
@@ -57,7 +64,9 @@ size      := lb.Size()
   glueberry) lives in raspberry.
 - A `BatchStore` and `CertificateStore` (LevelDB and in-memory variants
   ship in `store/`).
-- A `TxValidator` (CheckTx-style sanity check before queueing).
+- A `TxValidator` (CheckTx-style sanity check before queueing; returns
+  a `types.TxAdmission` for priority ordering, or the zero value for
+  FIFO).
 - A validator set with `Signer`s.
 
 ## Layout
