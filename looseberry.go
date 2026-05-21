@@ -519,6 +519,13 @@ func (l *Looseberry) rebroadcastIfStuck() {
 
 // initializeStores creates storage if not already set.
 func (l *Looseberry) initializeStores() error {
+	// Persistent stores use goleveldb. PLAN §E2 experimented with
+	// cockroachdb/pebble — for looseberry's workload (small DBs, few
+	// writer goroutines, ~50 batches/sec) pebble regressed every sweep
+	// scenario by 3-17% and reintroduced the 200k-v0-only bimodality
+	// (collapsed from 6,500 TPS to 322 TPS). Pebble's design wins
+	// (group-commit, concurrent writers, larger databases) don't apply
+	// here.
 	if l.batchStore == nil {
 		if l.cfg.Storage.InMemory {
 			l.batchStore = store.NewMemoryBatchStore()
