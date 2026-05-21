@@ -247,11 +247,11 @@ func TestWorkerTxValidator(t *testing.T) {
 	w := New(0, 0, cfg, batchStore, txIndex, 3)
 
 	// Set validator that rejects empty transactions
-	w.SetTxValidator(func(tx []byte) error {
+	w.SetTxValidator(func(tx []byte) (types.TxAdmission, error) {
 		if len(tx) == 0 {
-			return types.ErrTxValidationFailed
+			return types.TxAdmission{}, types.ErrTxValidationFailed
 		}
-		return nil
+		return types.TxAdmission{}, nil
 	})
 
 	if err := w.Start(); err != nil {
@@ -269,6 +269,109 @@ func TestWorkerTxValidator(t *testing.T) {
 	validTx := types.Transaction([]byte("valid"))
 	if err := w.AddTx(validTx); err != nil {
 		t.Fatalf("AddTx for valid tx failed: %v", err)
+	}
+}
+
+// TestWorkerPriorityOrdering verifies that when a TxValidator returns
+// non-zero TxAdmission.Priority, the worker drains higher-priority txs
+// into the batch first. Equal-priority txs preserve admission order
+// (FIFO tiebreaker).
+func TestWorkerPriorityOrdering(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	cfg := DefaultConfig()
+	cfg.BatchSize = 5 // small batch so we can fit txs deliberately
+	cfg.BatchTimeout = 10 * time.Second
+	w := New(0, 0, cfg, batchStore, txIndex, 3)
+
+	// Validator that derives priority from a one-byte prefix.
+	w.SetTxValidator(func(tx []byte) (types.TxAdmission, error) {
+		if len(tx) == 0 {
+			return types.TxAdmission{}, nil
+		}
+		return types.TxAdmission{Priority: int64(tx[0])}, nil
+	})
+
+	captured := make(chan *types.Batch, 1)
+	w.SetBatchCallback(func(b *types.Batch) { captured <- b })
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = w.Stop() }()
+
+	// Admit in scrambled priority order; expected drain is high→low.
+	inserts := []byte{3, 1, 5, 2, 4}
+	for _, p := range inserts {
+		if err := w.AddTx(types.Transaction([]byte{p})); err != nil {
+			t.Fatalf("AddTx(%d): %v", p, err)
+		}
+	}
+
+	// Five admits hits BatchSize=5 and triggers immediate batch creation.
+	select {
+	case b := <-captured:
+		if len(b.Transactions) != 5 {
+			t.Fatalf("batch has %d txs, want 5", len(b.Transactions))
+		}
+		wantOrder := []byte{5, 4, 3, 2, 1}
+		for i, tx := range b.Transactions {
+			if tx[0] != wantOrder[i] {
+				t.Errorf("position %d: got priority %d, want %d (full order: %v)",
+					i, tx[0], wantOrder[i], wantOrder)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no batch produced within 2s")
+	}
+}
+
+// TestWorkerPriorityFIFOTiebreak verifies that equal-priority txs are
+// drained in admission order — the sequence-number tiebreaker in the
+// priorityQueue prevents reordering of same-priority entries.
+func TestWorkerPriorityFIFOTiebreak(t *testing.T) {
+	batchStore := store.NewMemoryBatchStore()
+	txIndex := store.NewMemoryTxIndex()
+	defer batchStore.Close()
+	defer txIndex.Close()
+
+	cfg := DefaultConfig()
+	cfg.BatchSize = 4
+	cfg.BatchTimeout = 10 * time.Second
+	w := New(0, 0, cfg, batchStore, txIndex, 3)
+
+	// All txs get the same priority — admission order should win.
+	w.SetTxValidator(func(tx []byte) (types.TxAdmission, error) {
+		return types.TxAdmission{Priority: 7}, nil
+	})
+
+	captured := make(chan *types.Batch, 1)
+	w.SetBatchCallback(func(b *types.Batch) { captured <- b })
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = w.Stop() }()
+
+	for i := byte(0); i < 4; i++ {
+		if err := w.AddTx(types.Transaction([]byte{i})); err != nil {
+			t.Fatalf("AddTx(%d): %v", i, err)
+		}
+	}
+
+	select {
+	case b := <-captured:
+		for i, tx := range b.Transactions {
+			if tx[0] != byte(i) {
+				t.Errorf("position %d: got tx 0x%02x, want 0x%02x (FIFO order broken)",
+					i, tx[0], i)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no batch produced within 2s")
 	}
 }
 

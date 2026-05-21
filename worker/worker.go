@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"container/heap"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -40,8 +41,49 @@ func DefaultConfig() Config {
 	}
 }
 
-// TxValidator validates a transaction before adding it to pending.
-type TxValidator func(tx []byte) error
+// TxValidator validates a transaction before adding it to pending and
+// reports the application's mempool-ordering hints. A nil error admits
+// the tx; the returned TxAdmission's Priority and Sender are used by
+// the worker to order pending txs (max-priority first, FIFO within
+// equal priorities). A non-nil error rejects the tx; the returned
+// admission is ignored.
+//
+// Apps that don't care about priority can return a zero TxAdmission
+// and rely on the worker's FIFO fallback.
+type TxValidator func(tx []byte) (types.TxAdmission, error)
+
+// pendingEntry holds a transaction together with the application-supplied
+// ordering hints from TxValidator.
+type pendingEntry struct {
+	tx       types.Transaction
+	priority int64
+	// sequence is a monotonic per-worker counter, used to break ties
+	// between equal-priority txs so admission order is preserved.
+	sequence uint64
+}
+
+// priorityQueue is a max-heap of pendingEntry sorted by priority (high
+// first), with FIFO arrival order as the tiebreaker. Implements
+// container/heap.Interface.
+type priorityQueue []*pendingEntry
+
+func (pq priorityQueue) Len() int { return len(pq) }
+func (pq priorityQueue) Less(i, j int) bool {
+	if pq[i].priority != pq[j].priority {
+		return pq[i].priority > pq[j].priority
+	}
+	return pq[i].sequence < pq[j].sequence
+}
+func (pq priorityQueue) Swap(i, j int)      { pq[i], pq[j] = pq[j], pq[i] }
+func (pq *priorityQueue) Push(x any)        { *pq = append(*pq, x.(*pendingEntry)) }
+func (pq *priorityQueue) Pop() any {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	*pq = old[:n-1]
+	return item
+}
 
 // BatchCallback is called when a batch is created and ready to broadcast.
 type BatchCallback func(batch *types.Batch)
@@ -55,10 +97,13 @@ type Worker struct {
 	round         atomic.Uint64
 	epoch         atomic.Uint64
 
-	// Pending transactions
-	pending      []types.Transaction
+	// Pending transactions. The queue is a max-heap of pendingEntry by
+	// priority (FIFO tiebreaker) so tryCreateBatch can pop the highest-
+	// priority txs first. pendingSet is the O(1) hash-membership index.
+	pending      *priorityQueue
 	pendingSet   map[types.Hash]bool
 	pendingBytes int64
+	pendingSeq   uint64
 	pendingMu    sync.Mutex
 
 	// Storage
@@ -91,7 +136,7 @@ func New(
 		id:          id,
 		validatorID: validatorID,
 		cfg:         cfg,
-		pending:     make([]types.Transaction, 0, cfg.BatchSize),
+		pending:     &priorityQueue{},
 		pendingSet:  make(map[types.Hash]bool),
 		batchStore:  batchStore,
 		txIndex:     txIndex,
@@ -190,9 +235,14 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 		return types.ErrNotRunning
 	}
 
-	// Validate transaction if validator is set
+	// Validate the transaction and capture the app's ordering hints.
+	// When no validator is wired, treat the tx as priority 0 / no sender —
+	// equivalent to pure FIFO.
+	var admission types.TxAdmission
 	if w.txValidator != nil {
-		if err := w.txValidator(tx); err != nil {
+		var err error
+		admission, err = w.txValidator(tx)
+		if err != nil {
 			return fmt.Errorf("%w: %v", types.ErrTxValidationFailed, err)
 		}
 	}
@@ -214,7 +264,7 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 	}
 
 	// Check backpressure
-	if len(w.pending) >= w.cfg.MaxPendingTxs {
+	if w.pending.Len() >= w.cfg.MaxPendingTxs {
 		w.pendingMu.Unlock()
 		return types.ErrWorkerBackpressure
 	}
@@ -223,13 +273,20 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 		return types.ErrWorkerBackpressure
 	}
 
-	// Add to pending
-	w.pending = append(w.pending, tx.Clone())
+	// Add to pending heap with the app's priority hint. Sequence is a
+	// per-worker monotonic counter so equal-priority entries drain in
+	// FIFO arrival order.
+	w.pendingSeq++
+	heap.Push(w.pending, &pendingEntry{
+		tx:       tx.Clone(),
+		priority: admission.Priority,
+		sequence: w.pendingSeq,
+	})
 	w.pendingSet[txHash] = true
 	w.pendingBytes += int64(tx.Size())
 
 	// Check if we should trigger immediate batch creation
-	shouldTrigger := len(w.pending) >= w.cfg.BatchSize ||
+	shouldTrigger := w.pending.Len() >= w.cfg.BatchSize ||
 		(w.cfg.BatchBytes > 0 && w.pendingBytes >= w.cfg.BatchBytes)
 
 	w.pendingMu.Unlock()
@@ -251,27 +308,31 @@ func (w *Worker) AddTx(tx types.Transaction) error {
 func (w *Worker) PendingCount() int {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
-	return len(w.pending)
+	return w.pending.Len()
 }
 
 // DrainPending removes and returns all pending transactions.
 // Used during worker scale-down to prevent transaction loss.
+//
+// The returned slice is NOT in priority order — drain is for
+// re-routing to other workers, not for inclusion. tryCreateBatch is
+// the only path that pops in priority order.
 func (w *Worker) DrainPending() []types.Transaction {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
 
-	if len(w.pending) == 0 {
+	if w.pending.Len() == 0 {
 		return nil
 	}
 
 	// Clone the transactions to return
-	txs := make([]types.Transaction, len(w.pending))
-	for i, tx := range w.pending {
-		txs[i] = tx.Clone()
+	txs := make([]types.Transaction, 0, w.pending.Len())
+	for _, e := range *w.pending {
+		txs = append(txs, e.tx.Clone())
 	}
 
 	// Clear pending state
-	w.pending = make([]types.Transaction, 0, w.cfg.BatchSize)
+	w.pending = &priorityQueue{}
 	w.pendingSet = make(map[types.Hash]bool)
 	w.pendingBytes = 0
 
@@ -342,45 +403,42 @@ func (w *Worker) batchLoop() {
 
 // tryCreateBatch creates a batch if there are enough pending transactions.
 // On storage failure, transactions are requeued to prevent data loss.
+//
+// Selection is highest-priority-first via heap.Pop; equal-priority txs
+// drain in arrival order (the sequence tiebreaker baked into
+// priorityQueue.Less). The BatchBytes cap applies as txs are popped: if
+// adding the next-priority tx would exceed the cap, stop and keep it for
+// the next batch.
 func (w *Worker) tryCreateBatch() {
 	w.pendingMu.Lock()
 
-	if len(w.pending) == 0 {
+	if w.pending.Len() == 0 {
 		w.pendingMu.Unlock()
 		return
 	}
 
-	// Take up to BatchSize transactions, also respecting BatchBytes limit
-	count := min(len(w.pending), w.cfg.BatchSize)
+	maxCount := w.cfg.BatchSize
+	if maxCount > w.pending.Len() {
+		maxCount = w.pending.Len()
+	}
 
-	// If BatchBytes is configured, limit batch size by bytes
-	if w.cfg.BatchBytes > 0 {
-		var batchBytes int64
-		for i := 0; i < count; i++ {
-			txBytes := int64(w.pending[i].Size())
-			if batchBytes+txBytes > w.cfg.BatchBytes && i > 0 {
-				count = i
-				break
-			}
-			batchBytes += txBytes
+	txs := make([]types.Transaction, 0, maxCount)
+	var batchBytes int64
+	for len(txs) < maxCount {
+		// Peek at the highest-priority entry without popping yet so we
+		// can honor the BatchBytes cap.
+		top := (*w.pending)[0]
+		txBytes := int64(top.tx.Size())
+		if w.cfg.BatchBytes > 0 && len(txs) > 0 && batchBytes+txBytes > w.cfg.BatchBytes {
+			break
 		}
+		entry := heap.Pop(w.pending).(*pendingEntry)
+		txs = append(txs, entry.tx)
+		batchBytes += txBytes
+		delete(w.pendingSet, entry.tx.Hash())
 	}
 
-	txs := make([]types.Transaction, count)
-	copy(txs, w.pending[:count])
-
-	// Remove from pending
-	w.pending = w.pending[count:]
-	for _, tx := range txs {
-		delete(w.pendingSet, tx.Hash())
-	}
-
-	// Update pending bytes
-	var newBytes int64
-	for _, tx := range w.pending {
-		newBytes += int64(tx.Size())
-	}
-	w.pendingBytes = newBytes
+	w.pendingBytes -= batchBytes
 
 	w.pendingMu.Unlock()
 
@@ -418,8 +476,13 @@ func (w *Worker) tryCreateBatch() {
 	}
 }
 
-// requeueTransactions adds transactions back to the pending pool after a storage failure.
-// This prevents transaction loss when storage operations fail.
+// requeueTransactions adds transactions back to the pending pool after a
+// storage failure. Re-admitted txs lose their original priority hint and
+// get priority=0 (they'll re-batch in FIFO order). This is acceptable
+// because requeueing only happens on a rare storage-fault path; the cost
+// of preserving exact priority would be threading admission metadata
+// through tryCreateBatch's failure handling for a code path that nobody
+// hits in steady state.
 func (w *Worker) requeueTransactions(txs []types.Transaction) {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
@@ -429,13 +492,18 @@ func (w *Worker) requeueTransactions(txs []types.Transaction) {
 		// Only add if not already pending (could happen with concurrent operations)
 		if !w.pendingSet[txHash] {
 			// Check backpressure - if at limit, we have to drop transactions
-			if len(w.pending) >= w.cfg.MaxPendingTxs {
+			if w.pending.Len() >= w.cfg.MaxPendingTxs {
 				break
 			}
 			if w.pendingBytes+int64(tx.Size()) > w.cfg.MaxPendingBytes {
 				break
 			}
-			w.pending = append(w.pending, tx)
+			w.pendingSeq++
+			heap.Push(w.pending, &pendingEntry{
+				tx:       tx,
+				priority: 0,
+				sequence: w.pendingSeq,
+			})
 			w.pendingSet[txHash] = true
 			w.pendingBytes += int64(tx.Size())
 		}

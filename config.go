@@ -7,10 +7,16 @@ import (
 	"github.com/blockberries/looseberry/types"
 )
 
-// TxValidator validates transactions before they are added to batches.
-// This wraps Application.CheckTx for pre-batch validation.
-// Return nil if the transaction is valid, or an error describing why it's invalid.
-type TxValidator func(tx []byte) error
+// TxValidator validates transactions before they are added to batches and
+// reports the application's mempool-ordering hints. Typically wraps
+// Application.CheckTx and forwards its GateVerdict.Priority/Sender into
+// the returned TxAdmission. A nil error admits the tx; the returned
+// TxAdmission is consumed by the underlying Worker to position the tx
+// in its priority-ordered pending heap.
+//
+// Apps with no fee model can return a zero TxAdmission — the worker
+// falls back to FIFO admission order.
+type TxValidator func(tx []byte) (types.TxAdmission, error)
 
 // Config contains all configuration options for Looseberry.
 type Config struct {

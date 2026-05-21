@@ -221,11 +221,11 @@ func TestLooseberryAddTxWithValidator(t *testing.T) {
 	cfg := createTestConfig(signers[0], 0)
 
 	// Set a tx validator that rejects certain transactions
-	cfg.TxValidator = func(tx []byte) error {
+	cfg.TxValidator = func(tx []byte) (types.TxAdmission, error) {
 		if string(tx) == "invalid" {
-			return types.ErrTxValidationFailed
+			return types.TxAdmission{}, types.ErrTxValidationFailed
 		}
-		return nil
+		return types.TxAdmission{}, nil
 	}
 
 	lb, err := New(cfg)

@@ -336,11 +336,11 @@ func TestPoolTxValidator(t *testing.T) {
 	cfg.Worker.BatchTimeout = 1 * time.Second
 
 	pool := NewPool(cfg, 0, batchStore, txIndex, 3)
-	pool.SetTxValidator(func(tx []byte) error {
+	pool.SetTxValidator(func(tx []byte) (types.TxAdmission, error) {
 		if len(tx) == 0 {
-			return types.ErrTxValidationFailed
+			return types.TxAdmission{}, types.ErrTxValidationFailed
 		}
-		return nil
+		return types.TxAdmission{}, nil
 	})
 
 	if err := pool.Start(); err != nil {
