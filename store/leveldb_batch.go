@@ -38,6 +38,12 @@ func NewLevelDBBatchStore(path string) (*LevelDBBatchStore, error) {
 }
 
 // SaveBatch stores a batch.
+//
+// Keeps the Has-then-Write pattern: while the Has adds a leveldb read on
+// the hot path, in practice it short-circuits the encode + write for the
+// 200k-v0-only burst where sync responses re-deliver the same batches
+// many times. Removing it regressed every sweep scenario by 5-95% (slow
+// path 200k-v0-only collapsed to 464 TPS / 88% commit).
 func (s *LevelDBBatchStore) SaveBatch(batch *types.Batch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
