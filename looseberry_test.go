@@ -64,6 +64,39 @@ func TestNewLooseberry(t *testing.T) {
 	_ = vs // Used for validator set
 }
 
+// TestLooseberry_CertQuorumCallback pins the observability hook
+// fired the moment a certificate is formed. Used by raspberry to
+// drive bapi's MempoolObserver.OnBatchCertified for tokenomics
+// participation tracking.
+func TestLooseberry_CertQuorumCallback(t *testing.T) {
+	_, signers := createTestValidatorSet(t, 4)
+	cfg := createTestConfig(signers[0], 0)
+	lb, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var observed *types.Certificate
+	lb.SetCertQuorumCallback(func(c *types.Certificate) {
+		observed = c
+	})
+
+	// Construct a minimal certificate and drive it through the
+	// formation callback directly. onCertificateFormed gates DAG and
+	// network operations on l.dag / l.network being non-nil, so the
+	// callback is the only side effect that runs.
+	hdr := types.NewHeader(0, 5, 0, nil, nil)
+	cert := &types.Certificate{Header: *hdr}
+	lb.onCertificateFormed(cert)
+
+	if observed == nil {
+		t.Fatal("CertQuorumCallback did not fire")
+	}
+	if observed.Header.Round != 5 {
+		t.Errorf("observed.Round = %d, want 5", observed.Header.Round)
+	}
+}
+
 func TestNewLooseberryInvalidConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ValidatorIndex = 0

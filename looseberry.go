@@ -117,6 +117,14 @@ type Looseberry struct {
 	// ackQuorumCallback fires when any tracked batch reaches ack quorum;
 	// raspberry wires it to a Prometheus histogram.
 	ackQuorumCallback worker.QuorumCallback
+	// certQuorumCallback fires the moment a certificate is formed for a
+	// header — this is the cert-quorum event, the durable
+	// committed-to-DAG signal. Used by raspberry to feed bapi's
+	// MempoolObserver.OnBatchCertified for tokenomics participation
+	// tracking. Distinct from ackQuorumCallback (which fires earlier,
+	// when a batch reaches 2f+1 acks; cert-quorum is the later event
+	// when the header REFERENCING that batch gets its 2f+1 votes).
+	certQuorumCallback func(cert *types.Certificate)
 
 	// Core components
 	workerPool     *worker.Pool
@@ -255,6 +263,20 @@ func (l *Looseberry) SetAckQuorumCallback(cb worker.QuorumCallback) {
 	if pool != nil {
 		pool.SetAckQuorumCallback(cb)
 	}
+}
+
+// SetCertQuorumCallback installs an observability hook fired the moment
+// a certificate is formed — the cert-quorum event (PLAN §7 D10 in the
+// stealth project; the durable, committed-to-DAG signal). Must be cheap
+// and non-blocking; runs on the primary's certificate-formation path.
+//
+// Used by raspberry to drive bapi's MempoolObserver.OnBatchCertified
+// for tokenomics participation tracking. Set this before Start() so
+// the very first cert of round 0 is observed.
+func (l *Looseberry) SetCertQuorumCallback(cb func(cert *types.Certificate)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.certQuorumCallback = cb
 }
 
 // SetStores sets the storage implementations.
@@ -1700,6 +1722,16 @@ func (l *Looseberry) onCertificateFormed(cert *types.Certificate) {
 	// Broadcast certificate to network
 	if l.network != nil {
 		_ = l.network.BroadcastCertificate(cert)
+	}
+
+	// Fire the external cert-quorum observer (raspberry wires this to
+	// bapi's MempoolObserver.OnBatchCertified). Snapshot the callback
+	// under mu so a concurrent SetCertQuorumCallback can't race a fire.
+	l.mu.RLock()
+	cb := l.certQuorumCallback
+	l.mu.RUnlock()
+	if cb != nil {
+		cb(cert)
 	}
 }
 
